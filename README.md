@@ -20,7 +20,7 @@
 - Операционная система: Ubuntu 24.04 LTS
 - Права суперпользователя (root)
 - Подключение к интернету
-- Rust 1.78+ (если собираете из исходников)
+- Rust 1.78+
 
 ## Установка
 
@@ -28,7 +28,7 @@
 
 ```bash
 # Клонируйте репозиторий
-git clone https://github.com/username/bash_script.git
+git clone https://github.com/Nikolaikolya/init_server
 cd bash_script
 
 # Сборка проекта
@@ -185,4 +185,4 @@ MIT
 
 ## Авторы
 
-Your Name <your.email@example.com> 
+Nikolay Fedotov <nikolay@web-ap.ru> 
