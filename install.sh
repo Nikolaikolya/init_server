@@ -3,10 +3,7 @@
 # Установка необходимых пакетов
 echo "Обновление системы и установка необходимых пакетов..."
 sudo apt update && sudo apt upgrade -y
-sudo apt install -y build-essential curl git pkg-config libssl-dev
-
-# Проверка установки libssl-dev
-pkg-config --libs openssl
+sudo apt install -y build-essential
 
 # Установка Rust через rustup
 if ! command -v rustc &> /dev/null; then
@@ -26,13 +23,9 @@ echo "Клонирование репозитория..."
 git clone $REPO_URL
 cd init_server || exit 1
 
-# Сборка проекта
-echo "Сборка проекта..."
-cargo build --release
-
 # Копирование исполняемого файла в каталог bin
 echo "Копирование исполняемого файла в каталог /usr/local/bin..."
-sudo cp target/release/bash_script /usr/local/bin/init_server
+sudo cp release/init_server /usr/local/bin/init_server
 sudo chmod +x /usr/local/bin/init_server
 
 # Проверка установки
