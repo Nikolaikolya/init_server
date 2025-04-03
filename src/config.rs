@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use base64::{decode, encode};
-use log::info;
+use log::{debug, info};
 use rand::{thread_rng, Rng};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -21,17 +21,26 @@ use aes_gcm::{
 use rand::rngs::OsRng;
 
 // Константы путей настроек сервера
-// Все эти директории располагаются в домашней директории пользователя
 pub const SERVER_SETTINGS_DIR: &str = "server-settings";
-pub const NGINX_CONF_DIR: &str = "server-settings/nginx/conf";
-pub const NGINX_LOGS_DIR: &str = "server-settings/nginx/logs";
-pub const NGINX_HTML_DIR: &str = "server-settings/nginx/html";
-pub const CERTBOT_WWW_DIR: &str = "server-settings/certbot/www";
-pub const CERTBOT_CONF_DIR: &str = "server-settings/certbot/conf";
-pub const GITLAB_RUNNER_DIR: &str = "server-settings/gitlab-runners/conf";
-pub const BACKUP_DIR: &str = "server-settings/backups";
-pub const AUDIT_DIR: &str = "server-settings/audit";
-pub const CONFIG_FILE: &str = "server-settings/config.json";
+pub const NGINX_CONF_DIR: &str = "nginx/conf";
+pub const NGINX_LOGS_DIR: &str = "nginx/logs";
+pub const NGINX_HTML_DIR: &str = "nginx/html";
+pub const CERTBOT_WWW_DIR: &str = "certbot/www";
+pub const CERTBOT_CONF_DIR: &str = "certbot/conf";
+pub const GITLAB_RUNNER_DIR: &str = "gitlab-runners/conf";
+pub const BACKUP_DIR: &str = "backups";
+pub const AUDIT_DIR: &str = "audit";
+pub const CONFIG_FILE: &str = "config.json";
+
+/// Получает полный путь к директории настроек сервера
+pub fn get_settings_dir(user: &str) -> String {
+    format!("/home/{}/{}", user, SERVER_SETTINGS_DIR)
+}
+
+/// Получает полный путь к поддиректории в директории настроек
+pub fn get_full_path(user: &str, subdir: &str) -> String {
+    format!("/home/{}/{}/{}", user, SERVER_SETTINGS_DIR, subdir)
+}
 
 #[derive(Error, Debug)]
 pub enum ConfigError {
@@ -215,36 +224,29 @@ impl ServerConfig {
     }
 
     /// Создает директории, необходимые для работы
-    pub fn create_directories() -> Result<()> {
-        // Директории создаются в корне проекта, а при запуске копируются в домашнюю директорию пользователя
-        create_dir_all(SERVER_SETTINGS_DIR)
-            .with_context(|| "Не удалось создать директорию server-settings")?;
-        create_dir_all(NGINX_CONF_DIR)
-            .with_context(|| "Не удалось создать директорию nginx/conf")?;
-        create_dir_all(NGINX_LOGS_DIR)
-            .with_context(|| "Не удалось создать директорию nginx/logs")?;
-        create_dir_all(NGINX_HTML_DIR)
-            .with_context(|| "Не удалось создать директорию nginx/html")?;
-        create_dir_all(CERTBOT_WWW_DIR)
-            .with_context(|| "Не удалось создать директорию certbot/www")?;
-        create_dir_all(CERTBOT_CONF_DIR)
-            .with_context(|| "Не удалось создать директорию certbot/conf")?;
-        create_dir_all(GITLAB_RUNNER_DIR)
-            .with_context(|| "Не удалось создать директорию gitlab-runners/conf")?;
-        create_dir_all(BACKUP_DIR).with_context(|| "Не удалось создать директорию backups")?;
-        create_dir_all(AUDIT_DIR).with_context(|| "Не удалось создать директорию audit")?;
+    pub fn create_directories(user: &str) -> Result<()> {
+        let settings_dir = get_settings_dir(user);
 
-        // Создаем конфигурационный файл, если он не существует
-        let config_path = Path::new(CONFIG_FILE);
-        if !config_path.exists() {
-            let config = Self::default();
-            // Генерируем ключ шифрования, если его еще нет
-            let mut config_with_key = config.clone();
-            if config.encrypt_sensitive_data && config.encryption_key.is_none() {
-                let key = Aes256Gcm::generate_key(OsRng);
-                config_with_key.encryption_key = Some(encode(key));
-            }
-            config_with_key.save(config_path)?;
+        // Создаем основную директорию
+        create_dir_all(&settings_dir)
+            .with_context(|| format!("Не удалось создать директорию {}", settings_dir))?;
+
+        // Создаем поддиректории
+        let dirs = [
+            get_full_path(user, NGINX_CONF_DIR),
+            get_full_path(user, NGINX_LOGS_DIR),
+            get_full_path(user, NGINX_HTML_DIR),
+            get_full_path(user, CERTBOT_WWW_DIR),
+            get_full_path(user, CERTBOT_CONF_DIR),
+            get_full_path(user, GITLAB_RUNNER_DIR),
+            get_full_path(user, BACKUP_DIR),
+            get_full_path(user, AUDIT_DIR),
+        ];
+
+        for dir in &dirs {
+            create_dir_all(dir)
+                .with_context(|| format!("Не удалось создать директорию {}", dir))?;
+            debug!("Создана директория: {}", dir);
         }
 
         Ok(())

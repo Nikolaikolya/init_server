@@ -670,9 +670,6 @@ async fn try_init_server(
     ip_only: bool,
     setup_runners_enabled: bool,
 ) -> Result<()> {
-    // Создаем необходимые директории
-    ServerConfig::create_directories()?;
-
     // В автоматическом режиме используем переданные параметры или значения по умолчанию
     let (username, ssh_key_str) = if auto_mode {
         (
@@ -701,43 +698,8 @@ async fn try_init_server(
     let user = create_user(&username, "root").await?;
     setup_ssh_access(&user, ssh_key_str.as_deref(), "root").await?;
 
-    // Убедимся, что директории создаются в домашней директории пользователя
-    let home_dir = format!("/home/{}", user);
-    let settings_dir = format!("{}/server-settings", home_dir);
-
-    // Создаем директорию server-settings в домашней директории пользователя
-    fs::create_dir_all(&settings_dir)
-        .with_context(|| format!("Не удалось создать директорию {}", settings_dir))?;
-
-    // Устанавливаем правильные права доступа на директорию (только для Linux)
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&settings_dir, fs::Permissions::from_mode(0o755)).with_context(
-            || {
-                format!(
-                    "Не удалось установить права доступа на директорию {}",
-                    settings_dir
-                )
-            },
-        )?;
-    }
-
-    // На Windows просто пропускаем установку прав
-    #[cfg(not(target_os = "linux"))]
-    {
-        // Windows не поддерживает установку прав доступа в стиле Unix
-        info!("Пропускаем установку прав доступа на директорию (не поддерживается на Windows)");
-    }
-
-    // Изменяем владельца директории
-    security::execute_command_with_audit(
-        "chown",
-        &["-R", &format!("{}:{}", user, user), &settings_dir],
-        "root",
-        "Изменение владельца директории server-settings",
-    )
-    .await?;
+    // Создаем необходимые директории в домашней директории пользователя
+    ServerConfig::create_directories(&user)?;
 
     // Обновляем систему
     utils::update_system().await?;
@@ -751,95 +713,18 @@ async fn try_init_server(
     // Устанавливаем Nginx и Certbot
     nginx::setup_nginx(&user).await?;
 
+    // Загружаем или создаем конфигурацию
+    let config = ServerConfig::load(&format!("{}/config.json", config::get_settings_dir(&user)))?;
+
     // Настраиваем домены и SSL сертификаты
-    let domains = if auto_mode {
-        if ip_only {
-            Vec::new()
-        } else {
-            let config = ServerConfig::default();
-            config.domains
-        }
-    } else {
-        // В ручном режиме запрашиваем домены у пользователя
-        let domains_input = Input::<String>::new()
-            .with_prompt(
-                "Введите домены в формате 'domain:port' или 'domain:static', разделенные запятыми",
-            )
-            .allow_empty(true)
-            .interact()?;
+    setup_domains(&config.domains, &config.admin_email, ip_only, &user).await?;
 
-        if domains_input.is_empty() {
-            Vec::new()
-        } else {
-            domains_input
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .collect()
-        }
-    };
-
-    let email = if auto_mode {
-        let config = ServerConfig::default();
-        config.admin_email
-    } else {
-        // В ручном режиме запрашиваем email у пользователя
-        Input::<String>::new()
-            .with_prompt("Введите email администратора для SSL сертификатов")
-            .default("admin@example.com".to_string())
-            .interact()?
-    };
-
-    setup_domains(&domains, &email, ip_only, &user).await?;
-
-    // Настраиваем GitLab Runners, если требуется
+    // Настраиваем GitLab Runners, если включено
     if setup_runners_enabled {
-        let runner_names = if auto_mode {
-            let config = ServerConfig::default();
-            config.gitlab_runners
-        } else {
-            // В ручном режиме запрашиваем имена раннеров у пользователя
-            let runners_input = Input::<String>::new()
-                .with_prompt("Введите имена GitLab Runners, разделенные запятыми")
-                .allow_empty(true)
-                .interact()?;
-
-            if runners_input.is_empty() {
-                Vec::new()
-            } else {
-                runners_input
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .collect()
-            }
-        };
-
-        setup_runners(&runner_names, &user).await?;
+        setup_runners(&config.gitlab_runners, &user).await?;
     }
 
-    // Настраиваем брандмауэр
-    let config = ServerConfig::default();
-    if config.enable_firewall {
-        security::configure_firewall(&config.allowed_ports, &user).await?;
-    }
-
-    // Меняем пароль для root
-    if auto_mode {
-        change_root_password("root").await?;
-    } else {
-        let change_root_pwd = Confirm::new()
-            .with_prompt("Хотите изменить пароль для root?")
-            .default(false)
-            .interact()?;
-
-        if change_root_pwd {
-            change_root_password(&user).await?;
-        }
-    }
-
-    // Очищаем старые бекапы
-    backup::clean_old_backups(5).await?;
-
-    info!("Инициализация сервера успешно завершена!");
+    info!("Инициализация сервера успешно завершена");
 
     Ok(())
 }

@@ -1,3 +1,4 @@
+use crate::config;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local};
 use log::{debug, error, info, warn};
@@ -46,10 +47,15 @@ impl AuditLog {
 
 /// Записывает информацию аудита в журнал
 pub async fn log_audit_event(audit_log: AuditLog, log_file: Option<&Path>) -> Result<()> {
-    let log_file = log_file.unwrap_or_else(|| Path::new("server-settings/audit/audit_log.json"));
+    let audit_path = if let Some(file) = log_file {
+        file.to_path_buf()
+    } else {
+        let settings_path = config::get_full_path(&audit_log.user, config::AUDIT_DIR);
+        std::path::PathBuf::from(format!("{}/audit_log.json", settings_path))
+    };
 
     // Создаем директорию для аудита, если она не существует
-    if let Some(parent) = log_file.parent() {
+    if let Some(parent) = audit_path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("Не удалось создать директорию для аудита: {:?}", parent))?;
     }
@@ -60,8 +66,8 @@ pub async fn log_audit_event(audit_log: AuditLog, log_file: Option<&Path>) -> Re
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
-        .open(log_file)
-        .with_context(|| format!("Не удалось открыть файл журнала аудита: {:?}", log_file))?;
+        .open(&audit_path)
+        .with_context(|| format!("Не удалось открыть файл журнала аудита: {:?}", audit_path))?;
 
     writeln!(file, "{}", log_json).with_context(|| "Не удалось записать лог аудита в файл")?;
 

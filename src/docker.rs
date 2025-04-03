@@ -3,7 +3,7 @@ use log::{debug, error, info, warn};
 use std::path::Path;
 use tokio::{fs, process::Command};
 
-use crate::{security, utils};
+use crate::{config, security, utils};
 
 /// Устанавливает Docker и Docker Compose
 pub async fn install_docker(user: &str) -> Result<()> {
@@ -251,7 +251,7 @@ pub async fn setup_gitlab_runners(
     info!("Настройка GitLab Runners...");
 
     // Создаем директорию для конфигурации
-    let config_dir = Path::new("server-settings/gitlab-runners/conf");
+    let config_dir = config::get_full_path(user, config::GITLAB_RUNNER_DIR);
     fs::create_dir_all(&config_dir)
         .await
         .context("Не удалось создать директорию для конфигурации GitLab Runners")?;
@@ -259,7 +259,7 @@ pub async fn setup_gitlab_runners(
     for runner_name in runner_names {
         info!("Настройка GitLab Runner: {}", runner_name);
 
-        let runner_config_dir = config_dir.join(runner_name);
+        let runner_config_dir = format!("{}/{}", config_dir, runner_name);
         fs::create_dir_all(&runner_config_dir)
             .await
             .with_context(|| {
@@ -279,7 +279,7 @@ pub async fn setup_gitlab_runners(
                 "--restart",
                 "always",
                 "-v",
-                &format!("{}:/etc/gitlab-runner", runner_config_dir.display()),
+                &format!("{}:/etc/gitlab-runner", runner_config_dir),
                 "-v",
                 "/var/run/docker.sock:/var/run/docker.sock",
                 "-v",
@@ -301,8 +301,6 @@ pub async fn setup_gitlab_runners(
         }
 
         // Регистрация GitLab Runner
-        info!("Регистрация GitLab Runner: {}", runner_name);
-
         let output = Command::new("docker")
             .args([
                 "exec",
@@ -346,21 +344,6 @@ pub async fn setup_gitlab_runners(
 
         info!("GitLab Runner {} успешно настроен", runner_name);
     }
-
-    // Логируем событие настройки GitLab Runners
-    let audit_log = security::AuditLog::new(
-        "gitlab_runners_setup",
-        user,
-        Some(&format!(
-            "Setup GitLab Runners: {}",
-            runner_names.join(", ")
-        )),
-        "success",
-        None,
-        None,
-    );
-
-    security::log_audit_event(audit_log, None).await?;
 
     info!("Все GitLab Runners успешно настроены");
 

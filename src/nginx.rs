@@ -52,11 +52,13 @@ impl DomainConfig {
 pub async fn setup_nginx(user: &str) -> Result<()> {
     info!("Настройка Nginx...");
 
+    let settings_dir = config::get_settings_dir(user);
+
     // Создаем необходимые директории
     for dir in &[
-        config::NGINX_CONF_DIR,
-        config::NGINX_LOGS_DIR,
-        config::NGINX_HTML_DIR,
+        config::get_full_path(user, config::NGINX_CONF_DIR),
+        config::get_full_path(user, config::NGINX_LOGS_DIR),
+        config::get_full_path(user, config::NGINX_HTML_DIR),
     ] {
         fs::create_dir_all(dir)
             .with_context(|| format!("Не удалось создать директорию: {}", dir))?;
@@ -65,7 +67,7 @@ pub async fn setup_nginx(user: &str) -> Result<()> {
     }
 
     // Создаем docker-compose.yml для Nginx
-    let docker_compose_path = format!("{}/docker-compose.yml", config::SERVER_SETTINGS_DIR);
+    let docker_compose_path = format!("{}/docker-compose.yml", settings_dir);
 
     let docker_compose_content = r#"version: '3'
 
@@ -114,7 +116,10 @@ networks:
     info!("Создан файл docker-compose.yml: {}", docker_compose_path);
 
     // Создаем базовую конфигурацию Nginx
-    let nginx_default_conf = format!("{}/default.conf", config::NGINX_CONF_DIR);
+    let nginx_default_conf = format!(
+        "{}/default.conf",
+        config::get_full_path(user, config::NGINX_CONF_DIR)
+    );
 
     let default_conf_content = r#"# Default Nginx configuration
 server {
@@ -145,13 +150,16 @@ server {
     );
 
     // Создаем тестовую страницу
-    let test_html_path = format!("{}/index.html", config::NGINX_HTML_DIR);
+    let test_html_path = format!(
+        "{}/index.html",
+        config::get_full_path(user, config::NGINX_HTML_DIR)
+    );
     utils::create_test_html(&test_html_path, "localhost").await?;
 
     // Запускаем Docker Compose
     let output = Command::new("docker-compose")
         .args(["-f", &docker_compose_path, "up", "-d"])
-        .current_dir(config::SERVER_SETTINGS_DIR)
+        .current_dir(&settings_dir)
         .output()
         .await
         .context("Не удалось запустить Docker Compose")?;

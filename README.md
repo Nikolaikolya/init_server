@@ -25,6 +25,13 @@
 
 ## Установка
 
+### Одной командой
+```bash
+curl -o install.sh https://raw.githubusercontent.com/Nikolaikolya/init_server/main/install.sh
+chmod +x install.sh
+./install.sh
+```
+
 ### Из исходного кода
 
 ```bash

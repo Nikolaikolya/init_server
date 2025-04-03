@@ -1,9 +1,13 @@
 [package]
-name = "bash_script"
+name = "init_server"
 version = "0.1.0"
 edition = "2021"
 description = "A Rust utility for initial server setup on Ubuntu 24"
-authors = ["Your Name <your.email@example.com>"]
+authors = ["Nikolay Fedotov <nikolay@web-ap.ru>"]
+build = "src/build.rs"
+
+[[bin]]
+name = "init_server"
 
 [features]
 default = ["windows-dev"]
