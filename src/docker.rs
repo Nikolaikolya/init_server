@@ -51,13 +51,7 @@ pub async fn install_docker(user: &str) -> Result<()> {
 
     // Установка Docker
     info!("Установка Docker Engine...");
-    for pkg in &[
-        "docker-ce",
-        "docker-ce-cli",
-        "containerd.io",
-        "docker-compose-plugin",
-        "docker-compose",
-    ] {
+    for pkg in &["docker-ce", "docker-compose"] {
         utils::install_package(pkg).await?;
     }
 

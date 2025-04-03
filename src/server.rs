@@ -206,6 +206,72 @@ mod uninstall_helpers {
 
         Ok(())
     }
+
+    /// Удаляет установленные пакеты
+    pub async fn remove_installed_packages(user: &str) -> Result<()> {
+        info!("Удаление установленных пакетов...");
+
+        let packages = ["docker-ce", "docker-compose", "fail2ban"];
+
+        for pkg in &packages {
+            if let Err(e) = security::execute_command_with_audit(
+                "apt-get",
+                &["remove", "-y", pkg],
+                user,
+                &format!("Удаление пакета {}", pkg),
+            )
+            .await
+            {
+                warn!("Ошибка при удалении пакета {}: {}", pkg, e);
+            }
+        }
+
+        // Очищаем неиспользуемые пакеты
+        if let Err(e) = security::execute_command_with_audit(
+            "apt-get",
+            &["autoremove", "-y"],
+            user,
+            "Очистка неиспользуемых пакетов",
+        )
+        .await
+        {
+            warn!("Ошибка при очистке пакетов: {}", e);
+        }
+
+        Ok(())
+    }
+
+    /// Удаляет созданного пользователя
+    pub async fn remove_created_user(user: &str) -> Result<()> {
+        info!("Удаление созданного пользователя...");
+
+        // Получаем список пользователей из /etc/passwd
+        let passwd = fs::read_to_string("/etc/passwd")?;
+        let users: Vec<&str> = passwd
+            .lines()
+            .filter(|line| {
+                let parts: Vec<&str> = line.split(':').collect();
+                parts.len() > 5 && parts[5].contains("/home") && parts[0] != "root"
+            })
+            .map(|line| line.split(':').next().unwrap())
+            .collect();
+
+        for username in users {
+            // Удаляем пользователя и его домашнюю директорию
+            if let Err(e) = security::execute_command_with_audit(
+                "userdel",
+                &["-r", username],
+                user,
+                &format!("Удаление пользователя {}", username),
+            )
+            .await
+            {
+                warn!("Ошибка при удалении пользователя {}: {}", username, e);
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// Изменяет пароль для пользователя root
@@ -324,7 +390,7 @@ async fn create_user(username: &str, user: &str) -> Result<String> {
     // Устанавливаем пароль для пользователя
     let password = if is_auto_mode {
         // В автоматическом режиме генерируем пароль
-        let generated_password = ServerConfig::generate_strong_password(12)?;
+        let generated_password = ServerConfig::generate_strong_password(16)?;
 
         logger::password_info(&format!(
             "Сгенерирован надежный пароль для {}: {}",
@@ -344,9 +410,8 @@ async fn create_user(username: &str, user: &str) -> Result<String> {
         generated_password
     } else {
         // В ручном режиме запрашиваем пароль у пользователя
-        let mut password = String::new();
         loop {
-            password = Password::new()
+            let password = Password::new()
                 .with_prompt(&format!(
                     "Введите пароль для {} (или оставьте пустым для генерации)",
                     username
@@ -355,9 +420,9 @@ async fn create_user(username: &str, user: &str) -> Result<String> {
                 .interact()?;
 
             if password.is_empty() {
-                password = ServerConfig::generate_strong_password(12)?;
-                logger::password_info(&format!("Сгенерирован надежный пароль: {}", &password));
-                break;
+                let generated = ServerConfig::generate_strong_password(16)?;
+                logger::password_info(&format!("Сгенерирован надежный пароль: {}", &generated));
+                break generated;
             }
 
             // Проверяем надежность пароля
@@ -376,21 +441,33 @@ async fn create_user(username: &str, user: &str) -> Result<String> {
                 continue;
             }
 
-            break;
+            break password;
         }
-
-        password
     };
 
-    // Устанавливаем пароль для пользователя
-    let shadow_hash = security::hash_password(&password)?;
-    security::execute_command_with_audit(
-        "usermod",
-        &["-p", &shadow_hash, username],
-        user,
-        &format!("Установка пароля для пользователя {}", username),
-    )
-    .await?;
+    // Устанавливаем пароль через chpasswd
+    let chpasswd_input = format!("{}:{}", username, password);
+    let mut child = Command::new("chpasswd")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("Не удалось запустить chpasswd")?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        tokio::io::AsyncWriteExt::write_all(&mut stdin, chpasswd_input.as_bytes())
+            .await
+            .context("Не удалось передать пароль в chpasswd")?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .await
+        .context("Ошибка выполнения chpasswd")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow::anyhow!("Ошибка установки пароля: {}", stderr));
+    }
 
     // Добавляем пользователя в группу sudo
     security::execute_command_with_audit(
@@ -762,31 +839,36 @@ pub async fn uninstall_server() -> Result<()> {
     // Останавливаем контейнеры
     if let Err(e) = uninstall_helpers::stop_containers(&settings_dir, current_user).await {
         warn!("Ошибка при остановке контейнеров: {}", e);
-        // Продолжаем процесс удаления
     }
 
     // Удаляем GitLab Runners
     if let Err(e) = uninstall_helpers::remove_gitlab_runners(&settings_dir, current_user).await {
         warn!("Ошибка при удалении GitLab Runners: {}", e);
-        // Продолжаем процесс удаления
-    }
-
-    // Удаляем Docker сеть
-    if let Err(e) = uninstall_helpers::remove_docker_network(current_user).await {
-        warn!("Ошибка при удалении Docker сети: {}", e);
-        // Продолжаем процесс удаления
     }
 
     // Восстанавливаем SSH конфигурацию
     if let Err(e) = uninstall_helpers::restore_ssh_config(current_user).await {
         warn!("Ошибка при восстановлении SSH конфигурации: {}", e);
-        // Продолжаем процесс удаления
+    }
+
+    // Удаляем установленные пакеты
+    if let Err(e) = uninstall_helpers::remove_installed_packages(current_user).await {
+        warn!("Ошибка при удалении пакетов: {}", e);
+    }
+
+    // Удаляем созданного пользователя
+    if let Err(e) = uninstall_helpers::remove_created_user(current_user).await {
+        warn!("Ошибка при удалении пользователя: {}", e);
+    }
+
+    // Удаляем Docker сеть в последнюю очередь
+    if let Err(e) = uninstall_helpers::remove_docker_network(current_user).await {
+        warn!("Ошибка при удалении Docker сети: {}", e);
     }
 
     // Удаляем директории с настройками
     if let Err(e) = uninstall_helpers::remove_server_settings(&settings_dir, current_user).await {
         warn!("Ошибка при удалении директорий с настройками: {}", e);
-        // Продолжаем процесс удаления
     }
 
     info!("Удаление настроек сервера успешно завершено");

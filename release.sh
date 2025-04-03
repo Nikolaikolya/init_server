@@ -6,7 +6,3 @@ cargo build --release
 
 # Перемещение исполняемого файла в каталог release
 mv target/release/init_server release/
-
-# Очистка
-cargo clean
-echo "Сборка завершена!"

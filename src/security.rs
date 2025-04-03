@@ -260,3 +260,27 @@ pub async fn set_permissions(path: &str, permissions: &str, user: &str, group: &
 
     Ok(())
 }
+
+/// Настраивает SSH доступ для пользователя
+pub async fn setup_ssh_access(username: &str, ssh_key: Option<&str>, user: &str) -> Result<()> {
+    info!("Настройка SSH доступа для пользователя {}...", username);
+
+    // Создаем бекап файла sshd_config
+    let sshd_config_path = "/etc/ssh/sshd_config";
+    let backup_path = format!("{}.bak", sshd_config_path);
+
+    // Создаем бекап только если он еще не существует
+    if !Path::new(&backup_path).exists() {
+        fs::copy(sshd_config_path, &backup_path).with_context(|| {
+            format!(
+                "Не удалось создать бекап файла конфигурации SSH: {}",
+                backup_path
+            )
+        })?;
+        info!("Создан бекап SSH конфигурации: {}", backup_path);
+    }
+
+    // ... existing code ...
+
+    Ok(())
+}
