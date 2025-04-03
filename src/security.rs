@@ -1,12 +1,12 @@
 use crate::config;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local};
-use log::{debug, error, info, warn};
+use log::{debug, error, info};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, OpenOptions},
     io::Write,
-    path::{Path, PathBuf},
+    path::Path,
 };
 use tokio::process::Command;
 use uuid::Uuid;

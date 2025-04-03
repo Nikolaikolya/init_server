@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use log::info;
+use log::{error, info};
 
 mod backup;
 mod bash_script;
@@ -21,7 +21,7 @@ mod utils;
 #[command(author, version, about, long_about = None)]
 struct Cli {
     #[command(subcommand)]
-    command: Option<Commands>,
+    command: Commands,
 
     /// Автоматический режим настройки без запросов пользователю
     #[arg(short, long)]
@@ -42,13 +42,41 @@ struct Cli {
     /// Включить настройку GitLab Runners
     #[arg(long)]
     setup_runners: bool,
+
+    /// Пароль для пользователя (только для ручного режима)
+    #[arg(long)]
+    password: Option<String>,
 }
 
 /// Команды, поддерживаемые утилитой
 #[derive(Subcommand)]
 enum Commands {
     /// Инициализация сервера (создание пользователя, настройка SSH, Docker, Nginx и т.д.)
-    Init,
+    Init {
+        /// Автоматический режим
+        #[arg(long)]
+        auto: bool,
+
+        /// Имя пользователя
+        #[arg(long)]
+        user: Option<String>,
+
+        /// SSH ключ
+        #[arg(long)]
+        ssh_key: Option<String>,
+
+        /// Использовать только IP (без доменов)
+        #[arg(long)]
+        ip_only: bool,
+
+        /// Настроить GitLab Runners
+        #[arg(long)]
+        setup_runners: bool,
+
+        /// Пароль для пользователя (только для ручного режима)
+        #[arg(long)]
+        password: Option<String>,
+    },
 
     /// Удаление настроек сервера (остановка контейнеров, удаление директорий, восстановление SSH)
     Uninstall,
@@ -72,31 +100,35 @@ enum Commands {
 /// и генерация bash-скриптов.
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
-
-    // Инициализация логгера
+    // Инициализируем логирование
     logger::init()?;
+
+    let cli = Cli::parse();
 
     info!("Запуск скрипта настройки сервера");
 
-    match &cli.command {
-        Some(Commands::Init) => {
-            server::init_server(
-                cli.auto,
-                cli.user,
-                cli.ssh_key,
-                cli.ip_only,
-                cli.setup_runners,
-            )
-            .await?;
+    match cli.command {
+        Commands::Init {
+            auto,
+            user,
+            ssh_key,
+            ip_only,
+            setup_runners,
+            password,
+        } => {
+            if auto && password.is_some() {
+                error!("Пароль нельзя задать в автоматическом режиме");
+                return Ok(());
+            }
+            server::init_server(auto, user, ssh_key, ip_only, setup_runners, password).await?;
         }
-        Some(Commands::Uninstall) => {
+        Commands::Uninstall => {
             server::uninstall_server().await?;
         }
-        Some(Commands::GenerateScripts {
+        Commands::GenerateScripts {
             output_dir,
             backup_dir,
-        }) => {
+        } => {
             info!("Генерация bash скриптов...");
 
             // Формируем пути для скриптов
@@ -122,16 +154,6 @@ async fn main() -> Result<()> {
             info!("  - Скрипт установки: {}", setup_script_path);
             info!("  - Скрипт обновления: {}", update_script_path);
             info!("  - Скрипт бэкапа: {}", backup_script_path);
-        }
-        None => {
-            // Если команда не указана, запускаем инициализацию сервера
-            // с соответствующими параметрами
-            if cli.auto {
-                server::init_server(true, cli.user, cli.ssh_key, cli.ip_only, cli.setup_runners)
-                    .await?;
-            } else {
-                server::init_server(false, None, None, false, false).await?;
-            }
         }
     }
 

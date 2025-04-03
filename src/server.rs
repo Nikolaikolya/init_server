@@ -357,7 +357,24 @@ async fn change_root_password(user: &str) -> Result<()> {
 }
 
 /// Создает нового пользователя с правами sudo
-async fn create_user(username: &str, user: &str) -> Result<String> {
+///
+/// # Arguments
+/// * `username` - Имя создаваемого пользователя
+/// * `user` - Имя текущего пользователя (для аудита)
+/// * `custom_password` - Опциональный пользовательский пароль
+///
+/// # Returns
+/// * `Result<String>` - Имя созданного пользователя или ошибка
+///
+/// # Examples
+/// ```rust
+/// let username = create_user("admin", "root", None).await?;
+/// ```
+async fn create_user(
+    username: &str,
+    user: &str,
+    custom_password: Option<String>,
+) -> Result<String> {
     info!("Создание пользователя {}...", username);
 
     // Проверяем существование пользователя
@@ -408,6 +425,15 @@ async fn create_user(username: &str, user: &str) -> Result<String> {
         );
 
         generated_password
+    } else if let Some(pwd) = custom_password {
+        // Проверяем надежность пользовательского пароля
+        if let Err(e) = security::check_password_strength(&pwd) {
+            return Err(anyhow::anyhow!(
+                "Пароль не соответствует требованиям: {}",
+                e
+            ));
+        }
+        pwd
     } else {
         // В ручном режиме запрашиваем пароль у пользователя
         loop {
@@ -487,6 +513,19 @@ async fn create_user(username: &str, user: &str) -> Result<String> {
 }
 
 /// Настраивает SSH доступ для пользователя
+///
+/// # Arguments
+/// * `username` - Имя пользователя для настройки SSH
+/// * `ssh_key` - Опциональный SSH ключ
+/// * `user` - Имя текущего пользователя (для аудита)
+///
+/// # Returns
+/// * `Result<()>` - Успех или ошибка настройки
+///
+/// # Examples
+/// ```rust
+/// setup_ssh_access("admin", Some("ssh-rsa ..."), "root").await?;
+/// ```
 async fn setup_ssh_access(username: &str, ssh_key: Option<&str>, user: &str) -> Result<()> {
     info!("Настройка SSH доступа для пользователя {}...", username);
 
@@ -606,6 +645,20 @@ async fn setup_ssh_access(username: &str, ssh_key: Option<&str>, user: &str) -> 
 }
 
 /// Настраивает домены для Nginx
+///
+/// # Arguments
+/// * `domains` - Список доменов для настройки
+/// * `admin_email` - Email администратора для SSL сертификатов
+/// * `ip_only` - Флаг работы только по IP
+/// * `user` - Имя текущего пользователя (для аудита)
+///
+/// # Returns
+/// * `Result<()>` - Успех или ошибка настройки
+///
+/// # Examples
+/// ```rust
+/// setup_domains(&["example.com"], "admin@example.com", false, "root").await?;
+/// ```
 async fn setup_domains(
     domains: &[String],
     admin_email: &str,
@@ -659,6 +712,18 @@ async fn setup_domains(
 }
 
 /// Настраивает GitLab Runners
+///
+/// # Arguments
+/// * `names` - Список имен для GitLab Runners
+/// * `user` - Имя текущего пользователя (для аудита)
+///
+/// # Returns
+/// * `Result<()>` - Успех или ошибка настройки
+///
+/// # Examples
+/// ```rust
+/// setup_runners(&["runner-1", "runner-2"], "root").await?;
+/// ```
 async fn setup_runners(names: &[String], user: &str) -> Result<()> {
     if names.is_empty() {
         info!("Список GitLab Runners пуст, пропускаем настройку");
@@ -683,12 +748,29 @@ async fn setup_runners(names: &[String], user: &str) -> Result<()> {
 }
 
 /// Инициализирует сервер с заданными параметрами
+///
+/// # Arguments
+/// * `auto_mode` - Режим автоматической настройки
+/// * `user_name` - Опциональное имя пользователя
+/// * `ssh_key` - Опциональный SSH ключ
+/// * `ip_only` - Флаг работы только по IP
+/// * `setup_runners_enabled` - Флаг настройки GitLab Runners
+/// * `password` - Опциональный пароль пользователя
+///
+/// # Returns
+/// * `Result<()>` - Успех или ошибка инициализации
+///
+/// # Examples
+/// ```rust
+/// init_server(false, Some("admin"), None, false, true, None).await?;
+/// ```
 pub async fn init_server(
     auto_mode: bool,
     user_name: Option<String>,
     ssh_key: Option<String>,
     ip_only: bool,
     setup_runners_enabled: bool,
+    password: Option<String>,
 ) -> Result<()> {
     info!("Начало инициализации сервера...");
 
@@ -704,6 +786,7 @@ pub async fn init_server(
         ssh_key,
         ip_only,
         setup_runners_enabled,
+        password,
     )
     .await;
 
@@ -746,6 +829,7 @@ async fn try_init_server(
     ssh_key: Option<String>,
     ip_only: bool,
     setup_runners_enabled: bool,
+    password: Option<String>,
 ) -> Result<()> {
     // В автоматическом режиме используем переданные параметры или значения по умолчанию
     let (username, ssh_key_str) = if auto_mode {
@@ -772,7 +856,7 @@ async fn try_init_server(
     };
 
     // Создаем пользователя и настраиваем SSH доступ
-    let user = create_user(&username, "root").await?;
+    let user = create_user(&username, "root", password).await?;
     setup_ssh_access(&user, ssh_key_str.as_deref(), "root").await?;
 
     // Создаем необходимые директории в домашней директории пользователя
@@ -806,7 +890,18 @@ async fn try_init_server(
     Ok(())
 }
 
-/// Удаляет настройки сервера
+/// Удаляет все настройки сервера
+///
+/// Останавливает контейнеры, удаляет GitLab Runners, восстанавливает SSH конфигурацию,
+/// удаляет установленные пакеты и созданных пользователей
+///
+/// # Returns
+/// * `Result<()>` - Успех или ошибка удаления
+///
+/// # Examples
+/// ```rust
+/// uninstall_server().await?;
+/// ```
 pub async fn uninstall_server() -> Result<()> {
     info!("Начало удаления настроек сервера...");
 

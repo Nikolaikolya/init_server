@@ -8,7 +8,7 @@ use std::{
 use anyhow::{Context, Result};
 use base64::{decode, encode};
 use log::{debug, info};
-use rand::{thread_rng, Rng};
+use rand::{thread_rng, Rng, RngCore};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -78,15 +78,7 @@ impl Default for ServerConfig {
             log_level: "info".to_string(),
             domains: vec![],
             admin_email: "admin@example.com".to_string(),
-            packages: vec![
-                "apt-transport-https".to_string(),
-                "ca-certificates".to_string(),
-                "curl".to_string(),
-                "gnupg".to_string(),
-                "lsb-release".to_string(),
-                "software-properties-common".to_string(),
-                "ufw".to_string(),
-            ],
+            packages: vec![],
             package_versions: HashMap::new(),
             encryption_key: None,
             encrypt_sensitive_data: true,
@@ -135,9 +127,7 @@ impl ServerConfig {
                 .with_context(|| format!("Не удалось создать директорию: {:?}", parent))?;
         }
 
-        let mut file = File::create(path)
-            .with_context(|| format!("Не удалось создать файл конфигурации: {:?}", path))?;
-        file.write_all(json.as_bytes())
+        fs::write(path, &json)
             .with_context(|| format!("Не удалось записать в файл конфигурации: {:?}", path))?;
 
         info!("Конфигурация сохранена в {:?}", path);
@@ -284,4 +274,71 @@ impl ServerConfig {
             Self::generate_strong_password(length)
         }
     }
+
+    /// Создает конфигурацию по умолчанию
+    pub fn create_default_config(user: &str) -> Result<ServerConfig> {
+        let config = ServerConfig {
+            domains: vec![],
+            admin_email: String::new(),
+            gitlab_runners: vec![],
+            encryption_key: generate_encryption_key()?,
+            log_level: "info".to_string(),
+            packages: vec![
+                "docker-ce".to_string(),
+                "docker-compose".to_string(),
+                "fail2ban".to_string(),
+                "ufw".to_string(),
+            ],
+            package_versions: Default::default(),
+            encrypt_sensitive_data: true,
+            enable_firewall: true,
+            allowed_ports: vec![80, 443],
+            docker_version: "latest".to_string(),
+            nginx_version: "latest".to_string(),
+            certbot_version: "latest".to_string(),
+            is_audit_enabled: true,
+        };
+
+        // Сохраняем конфигурацию
+        let config_path = format!("{}/config.json", get_settings_dir(user));
+        config.save(&config_path)?;
+
+        Ok(config)
+    }
+
+    /// Загружает или создает конфигурацию
+    pub fn load_or_create(user: &str) -> Result<Self> {
+        let config_path = format!("{}/config.json", get_settings_dir(user));
+
+        if Path::new(&config_path).exists() {
+            Self::load(&config_path)
+        } else {
+            Self::create_default_config(user)
+        }
+    }
+
+    /// Обновляет конфигурацию
+    pub fn update(
+        &mut self,
+        domains: Option<Vec<String>>,
+        admin_email: Option<String>,
+        gitlab_runners: Option<Vec<String>>,
+    ) {
+        if let Some(domains) = domains {
+            self.domains = domains;
+        }
+        if let Some(email) = admin_email {
+            self.admin_email = email;
+        }
+        if let Some(runners) = gitlab_runners {
+            self.gitlab_runners = runners;
+        }
+    }
+}
+
+/// Генерирует ключ шифрования для AES-256-GCM
+fn generate_encryption_key() -> Result<Option<String>> {
+    let mut key = vec![0u8; 32]; // 256 бит
+    OsRng.fill_bytes(&mut key);
+    Ok(Some(encode(key)))
 }

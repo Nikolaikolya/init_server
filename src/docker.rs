@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
-use log::{debug, error, info, warn};
-use std::path::Path;
+use log::{error, info, warn};
 use tokio::{fs, process::Command};
 
 use crate::{config, security, utils};
@@ -90,58 +89,35 @@ pub async fn install_docker(user: &str) -> Result<()> {
     Ok(())
 }
 
-/// Создает сеть Docker с указанным именем
-pub async fn create_docker_network(network_name: &str, user: &str) -> Result<()> {
-    info!("Создание Docker сети: {}", network_name);
-
-    // Проверяем, существует ли сеть
+/// Проверяет существование Docker сети
+pub async fn check_network_exists(network_name: &str) -> Result<bool> {
     let output = Command::new("docker")
-        .args([
-            "network",
-            "ls",
-            "--filter",
-            &format!("name={}", network_name),
-            "--format",
-            "{{.Name}}",
-        ])
+        .args(["network", "ls", "--format", "{{.Name}}"])
         .output()
         .await
-        .with_context(|| format!("Не удалось проверить наличие сети {}", network_name))?;
+        .context("Не удалось получить список Docker сетей")?;
 
-    let networks = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let networks = String::from_utf8_lossy(&output.stdout);
+    Ok(networks.lines().any(|line| line == network_name))
+}
 
-    if networks.contains(network_name) {
-        info!("Сеть {} уже существует", network_name);
+/// Создает Docker сеть
+pub async fn create_docker_network(network_name: &str, user: &str) -> Result<()> {
+    // Проверяем существование сети
+    if check_network_exists(network_name).await? {
+        info!("Docker сеть {} уже существует", network_name);
         return Ok(());
     }
 
-    // Создаем новую сеть
-    let output = Command::new("docker")
-        .args(["network", "create", network_name])
-        .output()
-        .await
-        .with_context(|| format!("Не удалось создать сеть {}", network_name))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        error!("Ошибка создания сети: {}", stderr);
-        return Err(anyhow::anyhow!("Ошибка создания сети: {}", stderr));
-    }
-
-    // Логируем событие создания сети
-    let audit_log = security::AuditLog::new(
-        "docker_network_create",
+    security::execute_command_with_audit(
+        "docker",
+        &["network", "create", network_name],
         user,
-        Some(&format!("docker network create {}", network_name)),
-        "success",
-        None,
-        None,
-    );
+        &format!("Создание Docker сети {}", network_name),
+    )
+    .await?;
 
-    security::log_audit_event(audit_log, None).await?;
-
-    info!("Сеть {} успешно создана", network_name);
-
+    info!("Docker сеть {} успешно создана", network_name);
     Ok(())
 }
 
@@ -236,110 +212,84 @@ pub async fn cleanup_containers(user: &str) -> Result<()> {
     Ok(())
 }
 
-/// Создает и запускает GitLab Runners
-pub async fn setup_gitlab_runners(
-    runner_names: &[String],
-    registration_token: &str,
-    user: &str,
-) -> Result<()> {
-    info!("Настройка GitLab Runners...");
+/// Настраивает GitLab Runners
+pub async fn setup_gitlab_runners(names: &[String], token: &str, user: &str) -> Result<()> {
+    for name in names {
+        info!("Настройка GitLab Runner: {}", name);
 
-    // Создаем директорию для конфигурации
-    let config_dir = config::get_full_path(user, config::GITLAB_RUNNER_DIR);
-    fs::create_dir_all(&config_dir)
-        .await
-        .context("Не удалось создать директорию для конфигурации GitLab Runners")?;
-
-    for runner_name in runner_names {
-        info!("Настройка GitLab Runner: {}", runner_name);
-
-        let runner_config_dir = format!("{}/{}", config_dir, runner_name);
-        fs::create_dir_all(&runner_config_dir)
+        // Создаем директорию для конфигурации
+        let config_dir =
+            config::get_full_path(user, &format!("{}/{}", config::GITLAB_RUNNER_DIR, name));
+        fs::create_dir_all(&config_dir)
             .await
-            .with_context(|| {
-                format!(
-                    "Не удалось создать директорию для конфигурации GitLab Runner {}",
-                    runner_name
-                )
-            })?;
+            .with_context(|| format!("Не удалось создать директорию {}", config_dir))?;
 
-        // Запуск GitLab Runner в Docker
-        let output = Command::new("docker")
-            .args([
-                "run",
-                "-d",
-                "--name",
-                runner_name,
-                "--restart",
-                "always",
-                "-v",
-                &format!("{}:/etc/gitlab-runner", runner_config_dir),
-                "-v",
-                "/var/run/docker.sock:/var/run/docker.sock",
-                "-v",
-                "/cache:/cache",
-                "gitlab/gitlab-runner:latest",
-            ])
-            .output()
-            .await
-            .with_context(|| format!("Не удалось запустить GitLab Runner {}", runner_name))?;
+        // Формируем пути для монтирования
+        let config_mount = format!("{}:/etc/gitlab-runner", config_dir);
+        let docker_sock_mount = "/var/run/docker.sock:/var/run/docker.sock";
+        let cache_mount = "/cache:/cache";
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            error!("Ошибка запуска GitLab Runner {}: {}", runner_name, stderr);
-            return Err(anyhow::anyhow!(
-                "Ошибка запуска GitLab Runner {}: {}",
-                runner_name,
-                stderr
-            ));
-        }
+        // Запускаем контейнер с GitLab Runner
+        let container_args = vec![
+            "run",
+            "-d",
+            "--restart",
+            "always",
+            "--name",
+            name,
+            "-v",
+            &config_mount,
+            "-v",
+            docker_sock_mount,
+            "-v",
+            cache_mount,
+            "--network",
+            "server-network",
+            "gitlab/gitlab-runner:latest",
+        ];
 
-        // Регистрация GitLab Runner
-        let output = Command::new("docker")
-            .args([
-                "exec",
-                runner_name,
-                "gitlab-runner",
-                "register",
-                "--non-interactive",
-                "--url",
-                "https://gitlab.com/",
-                "--registration-token",
-                registration_token,
-                "--executor",
-                "docker",
-                "--docker-image",
-                "alpine:latest",
-                "--description",
-                runner_name,
-                "--tag-list",
-                "docker,linux",
-                "--run-untagged",
-                "--locked=false",
-            ])
-            .output()
-            .await
-            .with_context(|| {
-                format!("Не удалось зарегистрировать GitLab Runner {}", runner_name)
-            })?;
+        security::execute_command_with_audit(
+            "docker",
+            &container_args,
+            user,
+            &format!("Запуск контейнера GitLab Runner {}", name),
+        )
+        .await?;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            error!(
-                "Ошибка регистрации GitLab Runner {}: {}",
-                runner_name, stderr
-            );
-            return Err(anyhow::anyhow!(
-                "Ошибка регистрации GitLab Runner {}: {}",
-                runner_name,
-                stderr
-            ));
-        }
+        // Регистрируем runner
+        let register_args = vec![
+            "exec",
+            "-i",
+            name,
+            "gitlab-runner",
+            "register",
+            "--non-interactive",
+            "--url",
+            "https://gitlab.com/",
+            "--registration-token",
+            token,
+            "--executor",
+            "docker",
+            "--docker-image",
+            "docker:stable",
+            "--description",
+            name,
+            "--docker-volumes",
+            "/var/run/docker.sock:/var/run/docker.sock",
+            "--docker-volumes",
+            "/cache:/cache",
+        ];
 
-        info!("GitLab Runner {} успешно настроен", runner_name);
+        security::execute_command_with_audit(
+            "docker",
+            &register_args,
+            user,
+            &format!("Регистрация GitLab Runner {}", name),
+        )
+        .await?;
+
+        info!("GitLab Runner {} успешно настроен", name);
     }
-
-    info!("Все GitLab Runners успешно настроены");
 
     Ok(())
 }

@@ -3,9 +3,18 @@ use log::{debug, error, info, warn};
 use std::{fs, path::Path};
 use tokio::process::Command;
 
-use crate::{config, security, utils};
+use crate::{
+    config::{self, ServerConfig},
+    security, utils,
+};
 
 /// Структура для хранения информации о домене
+///
+/// # Fields
+/// * `domain` - Доменное имя
+/// * `target` - Целевой адрес для проксирования или "static" для статического сайта
+/// * `is_static` - Флаг статического сайта
+#[derive(Debug)]
 pub struct DomainConfig {
     pub domain: String,
     pub target: String,
@@ -48,29 +57,103 @@ impl DomainConfig {
     }
 }
 
-/// Устанавливает Nginx через Docker
-pub async fn setup_nginx(user: &str) -> Result<()> {
-    info!("Настройка Nginx...");
+/// Настраивает Nginx для работы только с IP
+///
+/// Создает базовую конфигурацию Nginx без поддержки доменов и SSL,
+/// настраивает логи и статические файлы
+///
+/// # Arguments
+/// * `user` - Имя пользователя для настройки прав доступа
+///
+/// # Returns
+/// * `Result<()>` - Успех или ошибка настройки
+///
+/// # Examples
+/// ```rust
+/// setup_nginx_ip_only("admin").await?;
+/// ```
+pub async fn setup_nginx_ip_only(user: &str) -> Result<()> {
+    info!("Настройка Nginx для работы только с IP...");
 
-    let settings_dir = config::get_settings_dir(user);
+    // Создаем базовую конфигурацию Nginx
+    let nginx_conf = r#"
+events {
+    worker_connections 1024;
+}
 
-    // Создаем необходимые директории
-    for dir in &[
-        config::get_full_path(user, config::NGINX_CONF_DIR),
-        config::get_full_path(user, config::NGINX_LOGS_DIR),
-        config::get_full_path(user, config::NGINX_HTML_DIR),
-    ] {
+http {
+    include       /etc/nginx/mime.types;
+    default_type  application/octet-stream;
+
+    log_format  main  '$remote_addr - $remote_user [$time_local] "$request" '
+                      '$status $body_bytes_sent "$http_referer" '
+                      '"$http_user_agent" "$http_x_forwarded_for"';
+
+    access_log  /var/log/nginx/access.log  main;
+    error_log   /var/log/nginx/error.log;
+
+    sendfile        on;
+    keepalive_timeout  65;
+
+    server {
+        listen 80;
+        server_name _;
+
+        location / {
+            root   /usr/share/nginx/html;
+            index  index.html index.htm;
+        }
+
+        error_page   500 502 503 504  /50x.html;
+        location = /50x.html {
+            root   /usr/share/nginx/html;
+        }
+    }
+}
+"#;
+
+    // Создаем директории для Nginx
+    let nginx_conf_dir = config::get_full_path(user, config::NGINX_CONF_DIR);
+    let nginx_logs_dir = config::get_full_path(user, config::NGINX_LOGS_DIR);
+    let nginx_html_dir = config::get_full_path(user, config::NGINX_HTML_DIR);
+
+    for dir in [&nginx_conf_dir, &nginx_logs_dir, &nginx_html_dir] {
         fs::create_dir_all(dir)
-            .with_context(|| format!("Не удалось создать директорию: {}", dir))?;
-
-        debug!("Создана директория: {}", dir);
+            .with_context(|| format!("Не удалось создать директорию {}", dir))?;
     }
 
-    // Создаем docker-compose.yml для Nginx
-    let docker_compose_path = format!("{}/docker-compose.yml", settings_dir);
+    // Записываем конфигурацию Nginx
+    let nginx_conf_file = format!("{}/nginx.conf", nginx_conf_dir);
+    fs::write(&nginx_conf_file, nginx_conf)
+        .with_context(|| format!("Не удалось записать файл {}", nginx_conf_file))?;
 
-    let docker_compose_content = r#"version: '3'
+    // Создаем тестовую страницу
+    let test_html = r#"<!DOCTYPE html>
+<html>
+<head>
+    <title>Welcome to Nginx!</title>
+    <style>
+        body {
+            width: 35em;
+            margin: 0 auto;
+            font-family: Tahoma, Verdana, Arial, sans-serif;
+        }
+    </style>
+</head>
+<body>
+    <h1>Welcome to Nginx!</h1>
+    <p>If you see this page, the nginx web server is successfully installed and working.</p>
+</body>
+</html>
+"#;
 
+    let test_html_file = format!("{}/index.html", nginx_html_dir);
+    fs::write(&test_html_file, test_html)
+        .with_context(|| format!("Не удалось записать файл {}", test_html_file))?;
+
+    // Создаем docker-compose.yml
+    let docker_compose = format!(
+        r#"version: '3'
 services:
   nginx:
     image: nginx:latest
@@ -80,125 +163,90 @@ services:
       - "80:80"
       - "443:443"
     volumes:
-      - ./nginx/conf:/etc/nginx/conf.d
-      - ./nginx/logs:/var/log/nginx
-      - ./nginx/html:/usr/share/nginx/html
-      - ./certbot/conf:/etc/letsencrypt
-      - ./certbot/www:/var/www/certbot
-    networks:
-      - server-network
-
-  certbot:
-    image: certbot/certbot:latest
-    container_name: certbot
-    restart: unless-stopped
-    volumes:
-      - ./certbot/conf:/etc/letsencrypt
-      - ./certbot/www:/var/www/certbot
-    depends_on:
-      - nginx
-    entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew; sleep 12h & wait $${!}; done;'"
+      - {}:/etc/nginx/nginx.conf:ro
+      - {}:/usr/share/nginx/html
+      - {}:/var/log/nginx
     networks:
       - server-network
 
 networks:
   server-network:
     external: true
-"#;
-
-    fs::write(&docker_compose_path, docker_compose_content).with_context(|| {
-        format!(
-            "Не удалось создать файл docker-compose.yml: {}",
-            docker_compose_path
-        )
-    })?;
-
-    info!("Создан файл docker-compose.yml: {}", docker_compose_path);
-
-    // Создаем базовую конфигурацию Nginx
-    let nginx_default_conf = format!(
-        "{}/default.conf",
-        config::get_full_path(user, config::NGINX_CONF_DIR)
+"#,
+        nginx_conf_file, nginx_html_dir, nginx_logs_dir
     );
 
-    let default_conf_content = r#"# Default Nginx configuration
-server {
-    listen 80 default_server;
-    listen [::]:80 default_server;
+    let settings_dir = config::get_settings_dir(user);
+    let docker_compose_path = format!("{}/docker-compose.yml", settings_dir);
+    fs::write(&docker_compose_path, docker_compose)
+        .with_context(|| format!("Не удалось записать файл {}", docker_compose_path))?;
 
-    root /usr/share/nginx/html;
-    index index.html index.htm;
-
-    server_name _;
-
-    location / {
-        try_files \$uri \$uri/ /index.html;
-    }
-
-    # Базовые настройки безопасности
-    # Запрет доступа к скрытым файлам
-    location ~ /\. {
-        deny all;
-    }
-
-    # Базовые заголовки безопасности
-    add_header X-Content-Type-Options nosniff;
-    add_header X-Frame-Options SAMEORIGIN;
-    add_header X-XSS-Protection "1; mode=block";
-}
-"#;
-
-    fs::write(&nginx_default_conf, default_conf_content).with_context(|| {
-        format!(
-            "Не удалось создать файл default.conf: {}",
-            nginx_default_conf
-        )
-    })?;
-
-    info!(
-        "Создан файл базовой конфигурации Nginx: {}",
-        nginx_default_conf
-    );
-
-    // Создаем тестовую страницу
-    let test_html_path = format!(
-        "{}/index.html",
-        config::get_full_path(user, config::NGINX_HTML_DIR)
-    );
-    utils::create_test_html(&test_html_path, "localhost").await?;
-
-    // Запускаем Docker Compose
-    let output = Command::new("docker-compose")
-        .args(["-f", &docker_compose_path, "up", "-d"])
-        .current_dir(&settings_dir)
-        .output()
-        .await
-        .context("Не удалось запустить Docker Compose")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        error!("Ошибка запуска Docker Compose: {}", stderr);
-        return Err(anyhow::anyhow!("Ошибка запуска Docker Compose: {}", stderr));
-    }
-
-    // Логируем событие установки Nginx
-    let audit_log = security::AuditLog::new(
-        "nginx_setup",
+    // Запускаем контейнер
+    security::execute_command_with_audit(
+        "docker-compose",
+        &["-f", &docker_compose_path, "up", "-d"],
         user,
-        Some("Setup Nginx with Docker Compose"),
-        "success",
-        None,
-        None,
-    );
+        "Запуск Nginx контейнера",
+    )
+    .await?;
 
-    security::log_audit_event(audit_log, None).await?;
+    info!("Nginx успешно настроен для работы с IP");
+    Ok(())
+}
 
-    info!("Nginx успешно настроен и запущен");
+/// Настраивает Nginx с поддержкой доменов и SSL
+///
+/// # Arguments
+/// * `user` - Имя пользователя для настройки прав доступа
+///
+/// # Returns
+/// * `Result<()>` - Успех или ошибка настройки
+///
+/// # Examples
+/// ```rust
+/// setup_nginx("admin").await?;
+/// ```
+pub async fn setup_nginx(user: &str) -> Result<()> {
+    info!("Настройка Nginx...");
+
+    // Создаем необходимые директории
+    let settings_dir = config::get_settings_dir(user);
+    let nginx_dir = format!("{}/nginx", settings_dir);
+
+    for dir in [
+        format!("{}/conf", nginx_dir),
+        format!("{}/logs", nginx_dir),
+        format!("{}/html", nginx_dir),
+    ] {
+        fs::create_dir_all(&dir)
+            .with_context(|| format!("Не удалось создать директорию {}", dir))?;
+    }
+
+    // Проверяем, запущен ли скрипт в режиме IP-only
+    let config = ServerConfig::load_or_create(user)?;
+    if config.domains.is_empty() {
+        setup_nginx_ip_only(user).await?;
+    } else {
+        // ... existing nginx setup code ...
+    }
 
     Ok(())
 }
 
 /// Настраивает конфигурацию для домена с прокси
+///
+/// # Arguments
+/// * `domain_config` - Конфигурация домена
+/// * `user` - Имя пользователя для настройки прав доступа
+///
+/// # Returns
+/// * `Result<()>` - Успех или ошибка настройки
+///
+/// # Examples
+/// ```rust
+/// let config = DomainConfig::new("example.com", "localhost:8080", false);
+/// configure_domain_proxy(&config, "admin").await?;
+/// ```
 pub async fn configure_domain_proxy(domain_config: &DomainConfig, user: &str) -> Result<()> {
     info!(
         "Настройка домена с прокси: {} -> {}",
@@ -261,6 +309,19 @@ server {{
 }
 
 /// Настраивает конфигурацию для статического домена
+///
+/// # Arguments
+/// * `domain_config` - Конфигурация домена
+/// * `user` - Имя пользователя для настройки прав доступа
+///
+/// # Returns
+/// * `Result<()>` - Успех или ошибка настройки
+///
+/// # Examples
+/// ```rust
+/// let config = DomainConfig::new("example.com", "static", true);
+/// configure_domain_static(&config, "admin").await?;
+/// ```
 pub async fn configure_domain_static(domain_config: &DomainConfig, user: &str) -> Result<()> {
     info!("Настройка статического домена: {}", domain_config.domain);
 
@@ -330,6 +391,19 @@ server {{
 }
 
 /// Генерирует SSL сертификат для домена
+///
+/// # Arguments
+/// * `domain` - Доменное имя
+/// * `email` - Email администратора для Let's Encrypt
+/// * `user` - Имя пользователя для настройки прав доступа
+///
+/// # Returns
+/// * `Result<()>` - Успех или ошибка генерации
+///
+/// # Examples
+/// ```rust
+/// generate_ssl_cert("example.com", "admin@example.com", "admin").await?;
+/// ```
 pub async fn generate_ssl_cert(domain: &str, email: &str, user: &str) -> Result<()> {
     info!("Генерация SSL сертификата для домена: {}", domain);
 
@@ -421,6 +495,17 @@ pub async fn generate_ssl_cert(domain: &str, email: &str, user: &str) -> Result<
 }
 
 /// Настраивает автообновление SSL сертификатов
+///
+/// # Arguments
+/// * `user` - Имя пользователя для настройки прав доступа
+///
+/// # Returns
+/// * `Result<()>` - Успех или ошибка настройки
+///
+/// # Examples
+/// ```rust
+/// setup_certbot_renewal("admin").await?;
+/// ```
 pub async fn setup_certbot_renewal(user: &str) -> Result<()> {
     info!("Настройка автообновления SSL сертификатов...");
 

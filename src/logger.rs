@@ -1,52 +1,57 @@
 use anyhow::Result;
 use colored::*;
-use env_logger::Builder;
-use log::{Level, LevelFilter};
-use std::io::Write;
+use env_logger::{Builder, Env};
+use log::LevelFilter;
 
-/// Инициализирует логгер с цветными уровнями логирования
+/// Инициализирует логирование
+///
+/// # Returns
+/// * `Result<()>` - Успех или ошибка инициализации
+///
+/// # Examples
+/// ```rust
+/// logger::init()?;
+/// ```
 pub fn init() -> Result<()> {
-    let mut builder = Builder::new();
+    let env = Env::default()
+        .filter_or("RUST_LOG", "info")
+        .write_style_or("RUST_LOG_STYLE", "always");
 
-    builder
-        .format(|buf, record| {
-            let level_str = match record.level() {
-                Level::Error => "ERROR".red().bold(),
-                Level::Warn => "WARNING".yellow().bold(),
-                Level::Info => "INFO".green(),
-                Level::Debug => "DEBUG".blue(),
-                Level::Trace => "TRACE".normal(),
-            };
-
-            writeln!(
-                buf,
-                "{} [{}] {}",
-                chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
-                level_str,
-                record.args()
-            )
-        })
+    Builder::from_env(env)
+        .format_timestamp_secs()
+        .format_module_path(true)
         .filter(None, LevelFilter::Info)
         .init();
 
     Ok(())
 }
 
-/// Выводит командную информацию, которая выделяется особым цветом
-pub fn command_info(message: &str) {
-    println!("{} {}", "[COMMAND]".magenta().bold(), message.cyan().bold());
-}
-
-/// Выводит сообщение об успешном завершении с зеленым цветом
-pub fn success(message: &str) {
-    println!("{} {}", "[SUCCESS]".green().bold(), message);
-}
-
-/// Выводит сообщение о пароле генерации с особым цветом
-pub fn password_info(password: &str) {
+/// Логирует информацию о пароле в безопасном режиме
+///
+/// # Arguments
+/// * `message` - Сообщение для логирования
+///
+/// # Examples
+/// ```rust
+/// logger::password_info("Сгенерирован пароль: 123456");
+/// ```
+pub fn password_info(message: &str) {
     println!(
         "{} {}",
-        "[GENERATED PASSWORD]".magenta().bold().on_yellow(),
-        password.white().bold().on_blue()
+        "[GENERATED PASSWORD]".magenta().bold(),
+        message.cyan().bold()
     );
+}
+
+/// Логирует успешное выполнение команды
+///
+/// # Arguments
+/// * `message` - Сообщение для логирования
+///
+/// # Examples
+/// ```rust
+/// logger::success("Команда успешно выполнена");
+/// ```
+pub fn success(message: &str) {
+    println!("{} {}", "[SUCCESS]".green().bold(), message);
 }
