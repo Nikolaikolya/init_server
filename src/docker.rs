@@ -56,6 +56,7 @@ pub async fn install_docker(user: &str) -> Result<()> {
         "docker-ce-cli",
         "containerd.io",
         "docker-compose-plugin",
+        "docker-compose",
     ] {
         utils::install_package(pkg).await?;
     }

@@ -3,7 +3,10 @@
 # Установка необходимых пакетов
 echo "Обновление системы и установка необходимых пакетов..."
 sudo apt update && sudo apt upgrade -y
-sudo apt install -y build-essential curl git
+sudo apt install -y build-essential curl git pkg-config libssl-dev
+
+# Проверка установки libssl-dev
+pkg-config --libs openssl
 
 # Установка Rust через rustup
 if ! command -v rustc &> /dev/null; then

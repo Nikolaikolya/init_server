@@ -12,21 +12,26 @@ mod security;
 mod server;
 mod utils;
 
+/// Утилита автоматизированной настройки серверов на базе Ubuntu 24
+///
+/// Предоставляет инструменты для настройки пользователей, SSH, Docker, Nginx,
+/// SSL-сертификатов, GitLab Runners и других компонентов для быстрого и безопасного
+/// развертывания серверной инфраструктуры
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
-    /// Автоматический режим настройки
+    /// Автоматический режим настройки без запросов пользователю
     #[arg(short, long)]
     auto: bool,
 
-    /// Имя пользователя для создания
+    /// Имя пользователя для создания (если не указан, будет создан пользователь 'admin')
     #[arg(short, long)]
     user: Option<String>,
 
-    /// SSH-ключ для добавления пользователю
+    /// SSH-ключ для добавления пользователю (если не указан, будет запрошен интерактивно)
     #[arg(long)]
     ssh_key: Option<String>,
 
@@ -34,29 +39,37 @@ struct Cli {
     #[arg(long)]
     ip_only: bool,
 
-    /// Настройка GitLab Runners
+    /// Включить настройку GitLab Runners
     #[arg(long)]
     setup_runners: bool,
 }
 
+/// Команды, поддерживаемые утилитой
 #[derive(Subcommand)]
 enum Commands {
-    /// Инициализация сервера
+    /// Инициализация сервера (создание пользователя, настройка SSH, Docker, Nginx и т.д.)
     Init,
-    /// Удаление настроек сервера
+
+    /// Удаление настроек сервера (остановка контейнеров, удаление директорий, восстановление SSH)
     Uninstall,
-    /// Генерация bash скриптов
+
+    /// Генерация bash скриптов для автоматизации процессов настройки, обновления и бэкапа
     GenerateScripts {
-        /// Путь для сохранения скриптов
+        /// Путь для сохранения скриптов (по умолчанию /usr/local/bin)
         #[arg(short, long, default_value = "/usr/local/bin")]
         output_dir: String,
 
-        /// Директория для бэкапов
+        /// Директория для бэкапов (по умолчанию /var/backups/server)
         #[arg(short, long, default_value = "/var/backups/server")]
         backup_dir: String,
     },
 }
 
+/// Точка входа программы
+///
+/// Обрабатывает аргументы командной строки и вызывает соответствующие функции.
+/// Поддерживает три основные команды: инициализация сервера, удаление настроек
+/// и генерация bash-скриптов.
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -111,6 +124,8 @@ async fn main() -> Result<()> {
             info!("  - Скрипт бэкапа: {}", backup_script_path);
         }
         None => {
+            // Если команда не указана, запускаем инициализацию сервера
+            // с соответствующими параметрами
             if cli.auto {
                 server::init_server(true, cli.user, cli.ssh_key, cli.ip_only, cli.setup_runners)
                     .await?;
