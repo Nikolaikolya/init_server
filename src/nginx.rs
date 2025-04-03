@@ -125,15 +125,26 @@ networks:
 server {
     listen 80 default_server;
     listen [::]:80 default_server;
+
+    root /usr/share/nginx/html;
+    index index.html index.htm;
+
     server_name _;
-    
-    location /.well-known/acme-challenge/ {
-        root /var/www/certbot;
-    }
-    
+
     location / {
-        return 444;
+        try_files \$uri \$uri/ /index.html;
     }
+
+    # Базовые настройки безопасности
+    # Запрет доступа к скрытым файлам
+    location ~ /\. {
+        deny all;
+    }
+
+    # Базовые заголовки безопасности
+    add_header X-Content-Type-Options nosniff;
+    add_header X-Frame-Options SAMEORIGIN;
+    add_header X-XSS-Protection "1; mode=block";
 }
 "#;
 
