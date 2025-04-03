@@ -172,18 +172,62 @@ pub async fn configure_firewall(ports: &[u16], user: &str) -> Result<()> {
 }
 
 /// Проверяет сложность пароля
-pub fn check_password_strength(password: &str) -> bool {
-    // Минимальная длина
+/// Пароль должен содержать минимум 8 символов, прописные и строчные буквы и цифры
+pub fn check_password_strength(password: &str) -> Result<()> {
     if password.len() < 8 {
-        return false;
+        return Err(anyhow::anyhow!(
+            "Пароль должен содержать не менее 8 символов"
+        ));
     }
 
-    // Проверяем наличие прописных и строчных букв и цифр
     let has_uppercase = password.chars().any(|c| c.is_uppercase());
     let has_lowercase = password.chars().any(|c| c.is_lowercase());
     let has_digit = password.chars().any(|c| c.is_digit(10));
 
-    has_uppercase && has_lowercase && has_digit
+    if !has_uppercase {
+        return Err(anyhow::anyhow!("Пароль должен содержать прописные буквы"));
+    }
+
+    if !has_lowercase {
+        return Err(anyhow::anyhow!("Пароль должен содержать строчные буквы"));
+    }
+
+    if !has_digit {
+        return Err(anyhow::anyhow!("Пароль должен содержать цифры"));
+    }
+
+    Ok(())
+}
+
+/// Хеширует пароль для использования в /etc/shadow
+pub fn hash_password(password: &str) -> Result<String> {
+    // Для Windows версии просто возвращаем временный хеш (в продакшене будет работать на Linux)
+    #[cfg(target_os = "windows")]
+    {
+        // Эмулируем хеш на Windows для тестирования
+        Ok(format!("$6$temp_hash${}", password))
+    }
+
+    // Полная реализация для Linux
+    #[cfg(not(target_os = "windows"))]
+    {
+        use argon2::{
+            password_hash::{rand_core::OsRng, PasswordHasher, SaltString},
+            Argon2,
+        };
+
+        // Генерируем соль
+        let salt = SaltString::generate(&mut OsRng);
+
+        // Хешируем пароль с использованием Argon2
+        let argon2 = Argon2::default();
+        let password_hash = argon2
+            .hash_password(password.as_bytes(), &salt)
+            .map_err(|e| anyhow::anyhow!("Не удалось хешировать пароль: {}", e))?
+            .to_string();
+
+        Ok(password_hash)
+    }
 }
 
 /// Установка прав доступа на файл/директорию

@@ -36,7 +36,7 @@ cargo --version
 ### Шаг 1: Клонирование репозитория
 
 ```bash
-git clone https://github.com/username/bash_script.git
+git clone https://github.com/Nikolaikolya/init_server
 cd bash_script
 ```
 

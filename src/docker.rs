@@ -10,13 +10,7 @@ pub async fn install_docker(user: &str) -> Result<()> {
     info!("Начало установки Docker...");
 
     // Установка зависимостей
-    for pkg in &[
-        "apt-transport-https",
-        "ca-certificates",
-        "curl",
-        "gnupg",
-        "lsb-release",
-    ] {
+    for pkg in &["fail2ban"] {
         utils::install_package(pkg).await?;
     }
 

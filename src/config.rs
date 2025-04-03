@@ -1,20 +1,27 @@
-use aes_gcm::{
-    aead::{Aead, KeyInit},
-    Aes256Gcm, Nonce,
-};
-use anyhow::{Context, Result};
-use base64::{decode, encode};
-use log::{debug, info, warn};
-use rand::{rngs::OsRng, RngCore};
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
-    fs,
-    path::{Path, PathBuf},
+    fs::{self, create_dir_all, File},
+    io::{Read, Write},
+    path::Path,
 };
-use uuid::Uuid;
 
+use anyhow::{Context, Result};
+use base64::{decode, encode};
+use log::info;
+use rand::{thread_rng, Rng};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+// Используем импорты aes-gcm более структурированно
+use aes_gcm::{
+    aead::{Aead, KeyInit},
+    Aes256Gcm, Key, Nonce,
+};
+// Используем OsRng из rand
+use rand::rngs::OsRng;
+
+// Константы путей настроек сервера
+// Все эти директории располагаются в домашней директории пользователя
 pub const SERVER_SETTINGS_DIR: &str = "server-settings";
 pub const NGINX_CONF_DIR: &str = "server-settings/nginx/conf";
 pub const NGINX_LOGS_DIR: &str = "server-settings/nginx/logs";
@@ -22,8 +29,23 @@ pub const NGINX_HTML_DIR: &str = "server-settings/nginx/html";
 pub const CERTBOT_WWW_DIR: &str = "server-settings/certbot/www";
 pub const CERTBOT_CONF_DIR: &str = "server-settings/certbot/conf";
 pub const GITLAB_RUNNER_DIR: &str = "server-settings/gitlab-runners/conf";
+pub const BACKUP_DIR: &str = "server-settings/backups";
+pub const AUDIT_DIR: &str = "server-settings/audit";
+pub const CONFIG_FILE: &str = "server-settings/config.json";
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Error, Debug)]
+pub enum ConfigError {
+    #[error("Ошибка шифрования: {0}")]
+    EncryptionError(String),
+    #[error("Ошибка чтения конфигурации: {0}")]
+    ReadError(String),
+    #[error("Ошибка записи конфигурации: {0}")]
+    WriteError(String),
+    #[error("Ошибка валидации пароля: {0}")]
+    PasswordValidation(String),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ServerConfig {
     pub log_level: String,
     pub domains: Vec<String>,
@@ -45,24 +67,26 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             log_level: "info".to_string(),
-            domains: Vec::new(),
+            domains: vec![],
             admin_email: "admin@example.com".to_string(),
             packages: vec![
-                "build-essential".to_string(),
-                "curl".to_string(),
                 "apt-transport-https".to_string(),
                 "ca-certificates".to_string(),
+                "curl".to_string(),
+                "gnupg".to_string(),
+                "lsb-release".to_string(),
                 "software-properties-common".to_string(),
+                "ufw".to_string(),
             ],
             package_versions: HashMap::new(),
             encryption_key: None,
             encrypt_sensitive_data: true,
             enable_firewall: true,
             allowed_ports: vec![22, 80, 443],
-            docker_version: "24.0.5".to_string(),
-            nginx_version: "1.25".to_string(),
-            certbot_version: "2.6.0".to_string(),
-            gitlab_runners: Vec::new(),
+            docker_version: "latest".to_string(),
+            nginx_version: "latest".to_string(),
+            certbot_version: "latest".to_string(),
+            gitlab_runners: vec!["runner-1".to_string(), "runner-2".to_string()],
             is_audit_enabled: true,
         }
     }
@@ -70,42 +94,44 @@ impl Default for ServerConfig {
 
 impl ServerConfig {
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let config_content = fs::read_to_string(&path).with_context(|| {
+        let path = path.as_ref();
+        if !path.exists() {
+            info!("Конфигурационный файл не найден, создаем по умолчанию");
+            let config = Self::default();
+            config.save(path)?;
+            return Ok(config);
+        }
+
+        let mut file = File::open(path)
+            .with_context(|| format!("Не удалось открыть файл конфигурации: {:?}", path))?;
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)
+            .with_context(|| format!("Не удалось прочитать файл конфигурации: {:?}", path))?;
+
+        serde_json::from_str(&contents).with_context(|| {
             format!(
-                "Не удалось прочитать файл конфигурации: {:?}",
-                path.as_ref()
+                "Не удалось десериализовать конфигурацию из файла: {:?}",
+                path
             )
-        })?;
-
-        let config: ServerConfig = toml::from_str(&config_content)
-            .with_context(|| "Не удалось распарсить файл конфигурации")?;
-
-        debug!("Конфигурация успешно загружена");
-        Ok(config)
+        })
     }
 
     pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        let config_content = toml::to_string_pretty(self)
-            .with_context(|| "Не удалось сериализовать конфигурацию")?;
+        let json = serde_json::to_string_pretty(self)
+            .with_context(|| "Не удалось сериализовать конфигурацию в JSON")?;
 
-        let parent_dir = path.as_ref().parent().with_context(|| {
-            format!(
-                "Невозможно определить родительскую директорию для {:?}",
-                path.as_ref()
-            )
-        })?;
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Не удалось создать директорию: {:?}", parent))?;
+        }
 
-        fs::create_dir_all(parent_dir)
-            .with_context(|| format!("Не удалось создать директорию: {:?}", parent_dir))?;
+        let mut file = File::create(path)
+            .with_context(|| format!("Не удалось создать файл конфигурации: {:?}", path))?;
+        file.write_all(json.as_bytes())
+            .with_context(|| format!("Не удалось записать в файл конфигурации: {:?}", path))?;
 
-        fs::write(&path, config_content).with_context(|| {
-            format!(
-                "Не удалось записать конфигурацию в файл: {:?}",
-                path.as_ref()
-            )
-        })?;
-
-        info!("Конфигурация успешно сохранена в {:?}", path.as_ref());
+        info!("Конфигурация сохранена в {:?}", path);
         Ok(())
     }
 
@@ -115,36 +141,33 @@ impl ServerConfig {
             return Ok(plaintext.to_string());
         }
 
-        // Получаем или генерируем ключ шифрования
-        let encryption_key = match &self.encryption_key {
-            Some(key) => {
-                let mut hasher = Sha256::new();
-                hasher.update(key.as_bytes());
-                hasher.finalize().to_vec()
-            }
-            None => {
-                warn!("Ключ шифрования отсутствует, используем временный ключ");
-                let mut key = [0u8; 32];
-                OsRng.fill_bytes(&mut key);
-                key.to_vec()
-            }
-        };
+        let key_string = self
+            .encryption_key
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Encryption key is not set"))?;
 
-        // Создаем шифр и генерируем nonce
-        let cipher = Aes256Gcm::new_from_slice(&encryption_key)
-            .map_err(|e| anyhow::anyhow!("Ошибка инициализации шифра: {}", e))?;
+        // Расшифровываем ключ из base64
+        let key_bytes = decode(&key_string)
+            .with_context(|| "Не удалось декодировать ключ шифрования из Base64")?;
 
-        let mut nonce_bytes = [0u8; 12];
-        OsRng.fill_bytes(&mut nonce_bytes);
+        // Преобразуем байты в ключ AES-256-GCM
+        let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
+
+        // Создаем шифр
+        let cipher = Aes256Gcm::new(key);
+
+        // Генерируем случайный nonce
+        let nonce_bytes = OsRng.gen::<[u8; 12]>(); // 96 бит
         let nonce = Nonce::from_slice(&nonce_bytes);
 
-        // Шифрование данных
+        // Шифруем
         let ciphertext = cipher
             .encrypt(nonce, plaintext.as_bytes())
             .map_err(|e| anyhow::anyhow!("Ошибка шифрования: {}", e))?;
 
         // Комбинируем nonce и шифротекст для хранения
-        let mut result = nonce.to_vec();
+        let mut result = Vec::new();
+        result.extend_from_slice(&nonce_bytes);
         result.extend_from_slice(&ciphertext);
 
         Ok(encode(result))
@@ -156,104 +179,107 @@ impl ServerConfig {
             return Ok(encrypted.to_string());
         }
 
-        // Получаем ключ шифрования
-        let encryption_key = match &self.encryption_key {
-            Some(key) => {
-                let mut hasher = Sha256::new();
-                hasher.update(key.as_bytes());
-                hasher.finalize().to_vec()
-            }
-            None => {
-                return Err(anyhow::anyhow!(
-                    "Ключ шифрования не установлен, невозможно расшифровать данные"
-                ));
-            }
-        };
+        let key_string = self
+            .encryption_key
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Encryption key is not set"))?;
 
-        // Создаем шифр
-        let cipher = Aes256Gcm::new_from_slice(&encryption_key)
-            .map_err(|e| anyhow::anyhow!("Ошибка инициализации шифра: {}", e))?;
-
-        // Декодирование из base64
-        let encrypted_data =
+        // Расшифровываем ключ и шифротекст из base64
+        let key_bytes = decode(&key_string)
+            .with_context(|| "Не удалось декодировать ключ шифрования из Base64")?;
+        let all_bytes =
             decode(encrypted).with_context(|| "Не удалось декодировать Base64 данные")?;
 
-        if encrypted_data.len() < 12 {
-            return Err(anyhow::anyhow!("Неверный формат шифрованных данных"));
+        if all_bytes.len() < 12 {
+            return Err(anyhow::anyhow!("Некорректный формат зашифрованных данных"));
         }
 
         // Извлекаем nonce и шифротекст
-        let nonce = Nonce::from_slice(&encrypted_data[..12]);
-        let ciphertext = &encrypted_data[12..];
+        let nonce_bytes = &all_bytes[..12];
+        let ciphertext = &all_bytes[12..];
 
-        // Дешифрование данных
+        // Преобразуем байты в ключ и nonce для AES-256-GCM
+        let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
+        let nonce = Nonce::from_slice(nonce_bytes);
+
+        // Создаем шифр
+        let cipher = Aes256Gcm::new(key);
+
+        // Расшифровываем
         let plaintext = cipher
             .decrypt(nonce, ciphertext)
-            .map_err(|e| anyhow::anyhow!("Ошибка дешифрования: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Ошибка расшифровки: {}", e))?;
 
         String::from_utf8(plaintext)
-            .with_context(|| "Не удалось преобразовать расшифрованные данные в UTF-8 строку")
+            .with_context(|| "Не удалось преобразовать расшифрованные данные в строку")
     }
 
     /// Создает директории, необходимые для работы
     pub fn create_directories() -> Result<()> {
-        let dirs = [
-            SERVER_SETTINGS_DIR,
-            NGINX_CONF_DIR,
-            NGINX_LOGS_DIR,
-            NGINX_HTML_DIR,
-            CERTBOT_WWW_DIR,
-            CERTBOT_CONF_DIR,
-            GITLAB_RUNNER_DIR,
-        ];
+        // Директории создаются в корне проекта, а при запуске копируются в домашнюю директорию пользователя
+        create_dir_all(SERVER_SETTINGS_DIR)
+            .with_context(|| "Не удалось создать директорию server-settings")?;
+        create_dir_all(NGINX_CONF_DIR)
+            .with_context(|| "Не удалось создать директорию nginx/conf")?;
+        create_dir_all(NGINX_LOGS_DIR)
+            .with_context(|| "Не удалось создать директорию nginx/logs")?;
+        create_dir_all(NGINX_HTML_DIR)
+            .with_context(|| "Не удалось создать директорию nginx/html")?;
+        create_dir_all(CERTBOT_WWW_DIR)
+            .with_context(|| "Не удалось создать директорию certbot/www")?;
+        create_dir_all(CERTBOT_CONF_DIR)
+            .with_context(|| "Не удалось создать директорию certbot/conf")?;
+        create_dir_all(GITLAB_RUNNER_DIR)
+            .with_context(|| "Не удалось создать директорию gitlab-runners/conf")?;
+        create_dir_all(BACKUP_DIR).with_context(|| "Не удалось создать директорию backups")?;
+        create_dir_all(AUDIT_DIR).with_context(|| "Не удалось создать директорию audit")?;
 
-        for dir in &dirs {
-            fs::create_dir_all(dir)
-                .with_context(|| format!("Не удалось создать директорию: {}", dir))?;
-            debug!("Создана директория: {}", dir);
+        // Создаем конфигурационный файл, если он не существует
+        let config_path = Path::new(CONFIG_FILE);
+        if !config_path.exists() {
+            let config = Self::default();
+            // Генерируем ключ шифрования, если его еще нет
+            let mut config_with_key = config.clone();
+            if config.encrypt_sensitive_data && config.encryption_key.is_none() {
+                let key = Aes256Gcm::generate_key(OsRng);
+                config_with_key.encryption_key = Some(encode(key));
+            }
+            config_with_key.save(config_path)?;
         }
 
         Ok(())
     }
 
     /// Генерирует надежный пароль
-    pub fn generate_strong_password(length: usize) -> String {
+    pub fn generate_strong_password(length: usize) -> Result<String> {
         if length < 8 {
-            panic!("Длина пароля должна быть не менее 8 символов");
+            return Err(anyhow::anyhow!(
+                "Длина пароля должна быть не менее 8 символов"
+            ));
         }
 
-        let charset = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()";
-        let charset_bytes = charset.as_bytes();
-        let mut rng = OsRng;
+        let mut rng = thread_rng();
+        let password: String = (0..length)
+            .map(|_| {
+                let char_type = rng.gen_range(0..3);
+                match char_type {
+                    0 => rng.gen_range(b'A'..=b'Z') as char, // Прописные
+                    1 => rng.gen_range(b'a'..=b'z') as char, // Строчные
+                    _ => rng.gen_range(b'0'..=b'9') as char, // Цифры
+                }
+            })
+            .collect();
 
-        let mut password = String::with_capacity(length);
+        // Проверяем, что пароль содержит все необходимые типы символов
+        let has_uppercase = password.chars().any(|c| c.is_uppercase());
+        let has_lowercase = password.chars().any(|c| c.is_lowercase());
+        let has_digit = password.chars().any(|c| c.is_digit(10));
 
-        let mut has_uppercase = false;
-        let mut has_lowercase = false;
-        let mut has_digit = false;
-
-        for _ in 0..length {
-            let idx = (rng.next_u32() as usize) % charset_bytes.len();
-            let ch = charset_bytes[idx] as char;
-
-            if ch.is_uppercase() {
-                has_uppercase = true;
-            }
-            if ch.is_lowercase() {
-                has_lowercase = true;
-            }
-            if ch.is_digit(10) {
-                has_digit = true;
-            }
-
-            password.push(ch);
+        if has_uppercase && has_lowercase && has_digit {
+            Ok(password)
+        } else {
+            // Повторяем генерацию, если не удовлетворяет требованиям
+            Self::generate_strong_password(length)
         }
-
-        // Если не соответствует требованиям, генерируем заново
-        if !has_uppercase || !has_lowercase || !has_digit {
-            return Self::generate_strong_password(length);
-        }
-
-        password
     }
 }

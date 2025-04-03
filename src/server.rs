@@ -1,197 +1,405 @@
+use std::{
+    fs::{self, File},
+    io::ErrorKind,
+    path::Path,
+    process::Stdio,
+};
+
 use anyhow::{Context, Result};
 use dialoguer::{Confirm, Input, Password};
 use log::{debug, error, info, warn};
-use std::{fs, path::Path};
 use tokio::process::Command;
 
 use crate::{backup, config, config::ServerConfig, docker, logger, nginx, security, utils};
 
-/// Меняет пароль для root пользователя
+// Модуль для логики удаления сервера
+mod uninstall_helpers {
+    use super::*;
+
+    /// Проверяет наличие директории server-settings в домашней директории пользователя
+    pub async fn check_home_settings_dir(user: &str) -> Result<String> {
+        let home_dir = format!("/home/{}", user);
+        let settings_dir = format!("{}/server-settings", home_dir);
+
+        // Проверяем существование директории
+        match fs::metadata(&settings_dir) {
+            Ok(_) => Ok(settings_dir),
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                // Если директория не найдена в домашней директории пользователя, ищем в текущей директории
+                match fs::metadata("server-settings") {
+                    Ok(_) => Ok("server-settings".to_string()),
+                    Err(e) => Err(anyhow::anyhow!(
+                        "Директория server-settings не найдена: {}",
+                        e
+                    )),
+                }
+            }
+            Err(e) => Err(anyhow::anyhow!(
+                "Ошибка проверки директории server-settings: {}",
+                e
+            )),
+        }
+    }
+
+    /// Останавливает Docker контейнеры, созданные при настройке сервера
+    pub async fn stop_containers(settings_dir: &str, user: &str) -> Result<()> {
+        info!("Останавливаем Docker контейнеры...");
+
+        let compose_dir = format!("{}/nginx", settings_dir);
+        let compose_file = format!("{}/docker-compose.yml", compose_dir);
+
+        if Path::new(&compose_file).exists() {
+            // Пытаемся остановить контейнеры с помощью docker-compose
+            let result = security::execute_command_with_audit(
+                "docker-compose",
+                &["-f", &compose_file, "down"],
+                user,
+                "Остановка Docker контейнеров",
+            )
+            .await;
+
+            if let Err(e) = result {
+                error!(
+                    "Не удалось остановить контейнеры через docker-compose: {}",
+                    e
+                );
+                // Пытаемся использовать альтернативную команду
+                security::execute_command_with_audit(
+                    "docker",
+                    &["stop", "nginx", "certbot"],
+                    user,
+                    "Альтернативная остановка Docker контейнеров",
+                )
+                .await?;
+            }
+
+            info!("Docker контейнеры успешно остановлены");
+        } else {
+            info!("Файл docker-compose.yml не найден, пропускаем остановку контейнеров");
+        }
+
+        Ok(())
+    }
+
+    /// Удаляет контейнеры GitLab Runners
+    pub async fn remove_gitlab_runners(settings_dir: &str, user: &str) -> Result<()> {
+        info!("Удаление GitLab Runners...");
+
+        let runners_dir = format!("{}/gitlab-runners/conf", settings_dir);
+        if !Path::new(&runners_dir).exists() {
+            info!("Директория GitLab Runners не найдена, пропускаем удаление");
+            return Ok(());
+        }
+
+        // Получаем список контейнеров GitLab Runners
+        let output = security::execute_command_with_audit(
+            "docker",
+            &[
+                "ps",
+                "-a",
+                "--filter",
+                "name=gitlab-runner",
+                "--format",
+                "{{.Names}}",
+            ],
+            user,
+            "Получение списка контейнеров GitLab Runners",
+        )
+        .await?;
+
+        // Если есть контейнеры, удаляем их
+        if !output.is_empty() {
+            let runner_names: Vec<&str> = output.lines().collect();
+
+            for runner in runner_names {
+                if let Err(e) = security::execute_command_with_audit(
+                    "docker",
+                    &["rm", "-f", runner],
+                    user,
+                    &format!("Удаление контейнера {}", runner),
+                )
+                .await
+                {
+                    error!("Не удалось удалить контейнер {}: {}", runner, e);
+                }
+            }
+
+            info!("GitLab Runners успешно удалены");
+        } else {
+            info!("GitLab Runners не найдены, пропускаем удаление");
+        }
+
+        Ok(())
+    }
+
+    /// Удаляет Docker сеть, созданную при настройке сервера
+    pub async fn remove_docker_network(user: &str) -> Result<()> {
+        info!("Удаление Docker сети...");
+
+        if let Err(e) = security::execute_command_with_audit(
+            "docker",
+            &["network", "rm", "server-network"],
+            user,
+            "Удаление Docker сети server-network",
+        )
+        .await
+        {
+            error!("Не удалось удалить Docker сеть: {}", e);
+        } else {
+            info!("Docker сеть успешно удалена");
+        }
+
+        Ok(())
+    }
+
+    /// Восстанавливает SSH конфигурацию из бекапа
+    pub async fn restore_ssh_config(user: &str) -> Result<()> {
+        info!("Восстановление SSH конфигурации...");
+
+        let ssh_config_path = "/etc/ssh/sshd_config";
+        let backup_path = format!("{}.bak", ssh_config_path);
+
+        if Path::new(&backup_path).exists() {
+            // Копируем бекап обратно
+            security::execute_command_with_audit(
+                "cp",
+                &[&backup_path, ssh_config_path],
+                user,
+                "Восстановление SSH конфигурации из бекапа",
+            )
+            .await?;
+
+            // Перезапускаем SSH сервис
+            security::execute_command_with_audit(
+                "systemctl",
+                &["restart", "sshd"],
+                user,
+                "Перезапуск SSH сервиса",
+            )
+            .await?;
+
+            info!("SSH конфигурация успешно восстановлена");
+        } else {
+            info!("Бекап SSH конфигурации не найден, пропускаем восстановление");
+        }
+
+        Ok(())
+    }
+
+    /// Удаляет директории, созданные при настройке сервера
+    pub async fn remove_server_settings(settings_dir: &str, _user: &str) -> Result<()> {
+        info!("Удаление директорий сервера...");
+
+        if !Path::new(settings_dir).exists() {
+            info!(
+                "Директория {} не найдена, пропускаем удаление",
+                settings_dir
+            );
+            return Ok(());
+        }
+
+        // Рекурсивно удаляем директорию настроек
+        fs::remove_dir_all(settings_dir)
+            .with_context(|| format!("Не удалось удалить директорию {}", settings_dir))?;
+
+        info!("Директории сервера успешно удалены");
+
+        Ok(())
+    }
+}
+
+/// Изменяет пароль для пользователя root
 async fn change_root_password(user: &str) -> Result<()> {
-    info!("Смена пароля для root пользователя...");
+    info!("Изменение пароля для root пользователя...");
 
-    let password = if user == "root" {
-        // Генерируем случайный пароль в автоматическом режиме
-        let generated_password = ServerConfig::generate_strong_password(16);
-        logger::password_info(&generated_password);
+    // Проверяем, запущен ли скрипт от имени root
+    if !utils::is_root() {
+        return Err(anyhow::anyhow!("Скрипт должен быть запущен от имени root"));
+    }
 
-        // Сохраняем пароль в файл
-        let password_file = "server-settings/root_password.txt";
+    // Автоматически генерируем надежный пароль в автоматическом режиме
+    // Определяем, запущены ли мы в автоматическом режиме
+    let is_auto_mode = user == "root";
+
+    let password = if is_auto_mode {
+        // В автоматическом режиме генерируем пароль
+        let generated_password = ServerConfig::generate_strong_password(12)?;
+
+        logger::password_info(&format!(
+            "Сгенерирован надежный пароль для root: {}",
+            &generated_password
+        ));
+
+        // Пишем пароль в файл для дальнейшего использования
+        let password_file = "root_password.txt";
         fs::write(password_file, &generated_password)
-            .with_context(|| format!("Не удалось сохранить пароль в файл: {}", password_file))?;
+            .with_context(|| format!("Не удалось записать пароль в файл {}", password_file))?;
 
-        // Устанавливаем безопасные права на файл
-        security::set_permissions(password_file, "600", user, user).await?;
+        info!("Пароль root сохранен в файле {}", password_file);
 
         generated_password
     } else {
         // В ручном режиме запрашиваем пароль у пользователя
-        let password = Password::new()
-            .with_prompt("Введите новый пароль для root")
-            .with_confirmation("Повторите пароль", "Пароли не совпадают")
-            .interact()?;
+        let mut password = String::new();
+        loop {
+            password = Password::new()
+                .with_prompt("Введите новый пароль для root (или оставьте пустым для генерации)")
+                .allow_empty_password(true)
+                .interact()?;
 
-        // Проверяем сложность пароля
-        if !security::check_password_strength(&password) {
-            return Err(anyhow::anyhow!("Пароль не соответствует требованиям безопасности (минимум 8 символов, прописные, строчные буквы и цифры)"));
+            if password.is_empty() {
+                password = ServerConfig::generate_strong_password(12)?;
+                logger::password_info(&format!("Сгенерирован надежный пароль: {}", &password));
+                break;
+            }
+
+            // Проверяем надежность пароля
+            if let Err(e) = security::check_password_strength(&password) {
+                error!("Пароль не соответствует требованиям: {}", e);
+                continue;
+            }
+
+            // Просим подтвердить пароль
+            let confirmation = Password::new()
+                .with_prompt("Подтвердите пароль")
+                .interact()?;
+
+            if password != confirmation {
+                error!("Пароли не совпадают, попробуйте еще раз");
+                continue;
+            }
+
+            break;
         }
 
         password
     };
 
-    // Меняем пароль для root
-    let passwd_cmd = format!("echo 'root:{}' | chpasswd", password);
-    let output = Command::new("sh")
-        .arg("-c")
-        .arg(passwd_cmd)
-        .output()
-        .await
-        .context("Не удалось сменить пароль для root")?;
+    // Устанавливаем пароль для root
+    let shadow_hash = security::hash_password(&password)?;
+    security::execute_command_with_audit(
+        "usermod",
+        &["-p", &shadow_hash, "root"],
+        "root",
+        "Изменение пароля root пользователя",
+    )
+    .await?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        error!("Ошибка смены пароля для root: {}", stderr);
-        return Err(anyhow::anyhow!("Ошибка смены пароля для root: {}", stderr));
-    }
-
-    // Логируем событие смены пароля
-    let audit_log =
-        security::AuditLog::new("root_password_change", user, None, "success", None, None);
-
-    security::log_audit_event(audit_log, None).await?;
-
-    info!("Пароль для root успешно изменен");
+    info!("Пароль для root пользователя успешно изменен");
 
     Ok(())
 }
 
 /// Создает нового пользователя с правами sudo
 async fn create_user(username: &str, user: &str) -> Result<String> {
-    info!("Создание пользователя: {}", username);
+    info!("Создание пользователя {}...", username);
 
-    // Проверяем, существует ли пользователь
-    let output = Command::new("id")
-        .arg(username)
-        .output()
-        .await
-        .with_context(|| {
-            format!(
-                "Не удалось проверить существование пользователя {}",
-                username
-            )
-        })?;
+    // Проверяем существование пользователя
+    let user_exists = security::execute_command_with_audit(
+        "id",
+        &["-u", username],
+        user,
+        &format!("Проверка существования пользователя {}", username),
+    )
+    .await
+    .is_ok();
 
-    // Если пользователь уже существует, возвращаем ошибку
-    if output.status.success() {
+    if user_exists {
         info!("Пользователь {} уже существует", username);
         return Ok(username.to_string());
     }
 
     // Создаем пользователя
-    let output = Command::new("useradd")
-        .args(["-m", "-s", "/bin/bash", username])
-        .output()
-        .await
-        .with_context(|| format!("Не удалось создать пользователя {}", username))?;
+    security::execute_command_with_audit(
+        "useradd",
+        &["-m", "-s", "/bin/bash", username],
+        user,
+        &format!("Создание пользователя {}", username),
+    )
+    .await?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        error!("Ошибка создания пользователя {}: {}", username, stderr);
-        return Err(anyhow::anyhow!(
-            "Ошибка создания пользователя {}: {}",
-            username,
-            stderr
+    // Определяем, запущены ли мы в автоматическом режиме
+    let is_auto_mode = user == "root";
+
+    // Устанавливаем пароль для пользователя
+    let password = if is_auto_mode {
+        // В автоматическом режиме генерируем пароль
+        let generated_password = ServerConfig::generate_strong_password(12)?;
+
+        logger::password_info(&format!(
+            "Сгенерирован надежный пароль для {}: {}",
+            username, &generated_password
         ));
-    }
 
-    // Генерируем или запрашиваем пароль
-    let password = if user == "root" {
-        // Генерируем случайный пароль в автоматическом режиме
-        let generated_password = ServerConfig::generate_strong_password(16);
-        logger::password_info(&generated_password);
-
-        // Сохраняем пароль в файл
-        let password_file = format!("server-settings/{}_password.txt", username);
+        // Пишем пароль в файл для дальнейшего использования
+        let password_file = format!("{}_password.txt", username);
         fs::write(&password_file, &generated_password)
-            .with_context(|| format!("Не удалось сохранить пароль в файл: {}", password_file))?;
+            .with_context(|| format!("Не удалось записать пароль в файл {}", password_file))?;
 
-        // Устанавливаем безопасные права на файл
-        security::set_permissions(&password_file, "600", user, user).await?;
+        info!(
+            "Пароль пользователя {} сохранен в файле {}",
+            username, password_file
+        );
 
         generated_password
     } else {
         // В ручном режиме запрашиваем пароль у пользователя
-        let password = Password::new()
-            .with_prompt(format!("Введите пароль для пользователя {}", username))
-            .with_confirmation("Повторите пароль", "Пароли не совпадают")
-            .interact()?;
+        let mut password = String::new();
+        loop {
+            password = Password::new()
+                .with_prompt(&format!(
+                    "Введите пароль для {} (или оставьте пустым для генерации)",
+                    username
+                ))
+                .allow_empty_password(true)
+                .interact()?;
 
-        // Проверяем сложность пароля
-        if !security::check_password_strength(&password) {
-            return Err(anyhow::anyhow!("Пароль не соответствует требованиям безопасности (минимум 8 символов, прописные, строчные буквы и цифры)"));
+            if password.is_empty() {
+                password = ServerConfig::generate_strong_password(12)?;
+                logger::password_info(&format!("Сгенерирован надежный пароль: {}", &password));
+                break;
+            }
+
+            // Проверяем надежность пароля
+            if let Err(e) = security::check_password_strength(&password) {
+                error!("Пароль не соответствует требованиям: {}", e);
+                continue;
+            }
+
+            // Просим подтвердить пароль
+            let confirmation = Password::new()
+                .with_prompt("Подтвердите пароль")
+                .interact()?;
+
+            if password != confirmation {
+                error!("Пароли не совпадают, попробуйте еще раз");
+                continue;
+            }
+
+            break;
         }
 
         password
     };
 
     // Устанавливаем пароль для пользователя
-    let passwd_cmd = format!("echo '{}:{}' | chpasswd", username, password);
-    let output = Command::new("sh")
-        .arg("-c")
-        .arg(passwd_cmd)
-        .output()
-        .await
-        .with_context(|| format!("Не удалось установить пароль для пользователя {}", username))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        error!(
-            "Ошибка установки пароля для пользователя {}: {}",
-            username, stderr
-        );
-        return Err(anyhow::anyhow!(
-            "Ошибка установки пароля для пользователя {}: {}",
-            username,
-            stderr
-        ));
-    }
+    let shadow_hash = security::hash_password(&password)?;
+    security::execute_command_with_audit(
+        "usermod",
+        &["-p", &shadow_hash, username],
+        user,
+        &format!("Установка пароля для пользователя {}", username),
+    )
+    .await?;
 
     // Добавляем пользователя в группу sudo
-    let output = Command::new("usermod")
-        .args(["-aG", "sudo", username])
-        .output()
-        .await
-        .with_context(|| {
-            format!(
-                "Не удалось добавить пользователя {} в группу sudo",
-                username
-            )
-        })?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        error!(
-            "Ошибка добавления пользователя {} в группу sudo: {}",
-            username, stderr
-        );
-        return Err(anyhow::anyhow!(
-            "Ошибка добавления пользователя {} в группу sudo: {}",
-            username,
-            stderr
-        ));
-    }
-
-    // Логируем событие создания пользователя
-    let audit_log = security::AuditLog::new(
-        "user_create",
+    security::execute_command_with_audit(
+        "usermod",
+        &["-aG", "sudo", username],
         user,
-        Some(&format!("Create user {} with sudo privileges", username)),
-        "success",
-        None,
-        None,
-    );
-
-    security::log_audit_event(audit_log, None).await?;
+        &format!("Добавление пользователя {} в группу sudo", username),
+    )
+    .await?;
 
     info!(
         "Пользователь {} успешно создан и добавлен в группу sudo",
@@ -412,6 +620,56 @@ pub async fn init_server(
         return Err(anyhow::anyhow!("Скрипт должен быть запущен от имени root"));
     }
 
+    // Обрабатываем ошибки и делаем откат при необходимости
+    let result = try_init_server(
+        auto_mode,
+        user_name,
+        ssh_key,
+        ip_only,
+        setup_runners_enabled,
+    )
+    .await;
+
+    if let Err(e) = &result {
+        error!("Произошла ошибка при инициализации сервера: {}", e);
+
+        // Спрашиваем пользователя, хочет ли он откатить изменения
+        if !auto_mode {
+            let rollback = Confirm::new()
+                .with_prompt("Произошла ошибка. Хотите откатить все изменения?")
+                .default(true)
+                .interact()?;
+
+            if rollback {
+                info!("Откат изменений...");
+                if let Err(rollback_err) = uninstall_server().await {
+                    error!("Ошибка при откате изменений: {}", rollback_err);
+                } else {
+                    info!("Изменения успешно откачены.");
+                }
+            }
+        } else {
+            // В автоматическом режиме делаем откат автоматически
+            info!("Автоматический откат изменений...");
+            if let Err(rollback_err) = uninstall_server().await {
+                error!("Ошибка при откате изменений: {}", rollback_err);
+            } else {
+                info!("Изменения успешно откачены.");
+            }
+        }
+    }
+
+    result
+}
+
+// Основная функция инициализации, выделенная для обработки ошибок
+async fn try_init_server(
+    auto_mode: bool,
+    user_name: Option<String>,
+    ssh_key: Option<String>,
+    ip_only: bool,
+    setup_runners_enabled: bool,
+) -> Result<()> {
     // Создаем необходимые директории
     ServerConfig::create_directories()?;
 
@@ -442,6 +700,44 @@ pub async fn init_server(
     // Создаем пользователя и настраиваем SSH доступ
     let user = create_user(&username, "root").await?;
     setup_ssh_access(&user, ssh_key_str.as_deref(), "root").await?;
+
+    // Убедимся, что директории создаются в домашней директории пользователя
+    let home_dir = format!("/home/{}", user);
+    let settings_dir = format!("{}/server-settings", home_dir);
+
+    // Создаем директорию server-settings в домашней директории пользователя
+    fs::create_dir_all(&settings_dir)
+        .with_context(|| format!("Не удалось создать директорию {}", settings_dir))?;
+
+    // Устанавливаем правильные права доступа на директорию (только для Linux)
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&settings_dir, fs::Permissions::from_mode(0o755)).with_context(
+            || {
+                format!(
+                    "Не удалось установить права доступа на директорию {}",
+                    settings_dir
+                )
+            },
+        )?;
+    }
+
+    // На Windows просто пропускаем установку прав
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Windows не поддерживает установку прав доступа в стиле Unix
+        info!("Пропускаем установку прав доступа на директорию (не поддерживается на Windows)");
+    }
+
+    // Изменяем владельца директории
+    security::execute_command_with_audit(
+        "chown",
+        &["-R", &format!("{}:{}", user, user), &settings_dir],
+        "root",
+        "Изменение владельца директории server-settings",
+    )
+    .await?;
 
     // Обновляем систему
     utils::update_system().await?;
@@ -552,130 +848,63 @@ pub async fn init_server(
 pub async fn uninstall_server() -> Result<()> {
     info!("Начало удаления настроек сервера...");
 
-    // Проверяем, запущен ли скрипт от имени root
-    if !utils::is_root() {
-        return Err(anyhow::anyhow!("Скрипт должен быть запущен от имени root"));
-    }
-
-    let confirm = if Confirm::new()
+    // Получаем подтверждение от пользователя
+    let confirmed = Confirm::new()
         .with_prompt(
             "Вы уверены, что хотите удалить все настройки сервера? Это действие необратимо.",
         )
         .default(false)
-        .interact()?
-    {
-        true
-    } else {
-        info!("Операция отменена пользователем");
+        .interact()?;
+
+    if !confirmed {
+        info!("Удаление отменено");
         return Ok(());
+    }
+
+    // Определяем текущего пользователя для логирования
+    let current_user = "root"; // Скрипт должен запускаться от имени root
+
+    // Ищем директорию с настройками сервера
+    let settings_dir = match uninstall_helpers::check_home_settings_dir(current_user).await {
+        Ok(dir) => dir,
+        Err(e) => {
+            warn!("Не удалось найти директорию с настройками сервера: {}", e);
+            // Используем значение по умолчанию
+            "server-settings".to_string()
+        }
     };
 
-    if confirm {
-        // Останавливаем контейнеры
-        let output = Command::new("docker-compose")
-            .args([
-                "-f",
-                &format!("{}/docker-compose.yml", config::SERVER_SETTINGS_DIR),
-                "down",
-            ])
-            .current_dir(config::SERVER_SETTINGS_DIR)
-            .output()
-            .await
-            .context("Не удалось остановить контейнеры")?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            warn!("Ошибка остановки контейнеров: {}", stderr);
-        }
-
-        // Удаляем GitLab Runners
-        let output = Command::new("docker")
-            .args([
-                "ps",
-                "-a",
-                "--filter",
-                "name=gitlab-runner",
-                "--format",
-                "{{.Names}}",
-            ])
-            .output()
-            .await
-            .context("Не удалось получить список GitLab Runners")?;
-
-        let runners = String::from_utf8_lossy(&output.stdout);
-        for runner in runners.lines() {
-            if !runner.is_empty() {
-                let output = Command::new("docker")
-                    .args(["rm", "-f", runner])
-                    .output()
-                    .await
-                    .with_context(|| format!("Не удалось удалить GitLab Runner {}", runner))?;
-
-                if !output.status.success() {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    warn!("Ошибка удаления GitLab Runner {}: {}", runner, stderr);
-                }
-            }
-        }
-
-        // Удаляем сеть Docker
-        let output = Command::new("docker")
-            .args(["network", "rm", "server-network"])
-            .output()
-            .await
-            .context("Не удалось удалить сеть Docker")?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            warn!("Ошибка удаления сети Docker: {}", stderr);
-        }
-
-        // Удаляем директорию с настройками
-        fs::remove_dir_all(config::SERVER_SETTINGS_DIR)
-            .context("Не удалось удалить директорию с настройками")?;
-
-        // Удаляем cron-задачу для обновления сертификатов
-        let cron_file = "/etc/cron.d/certbot-renewal";
-        if Path::new(cron_file).exists() {
-            fs::remove_file(cron_file)
-                .with_context(|| format!("Не удалось удалить файл: {}", cron_file))?;
-        }
-
-        // Восстанавливаем конфигурацию SSH
-        let sshd_config_path = "/etc/ssh/sshd_config";
-        let backup_path = format!("server-settings/backups/sshd_config_*");
-
-        let output = Command::new("ls")
-            .args(["-t", &backup_path])
-            .output()
-            .await
-            .context("Не удалось найти бекап файла sshd_config")?;
-
-        let backups = String::from_utf8_lossy(&output.stdout);
-        if let Some(newest_backup) = backups.lines().next() {
-            if !newest_backup.is_empty() {
-                fs::copy(newest_backup, sshd_config_path).with_context(|| {
-                    format!(
-                        "Не удалось восстановить файл sshd_config из бекапа: {}",
-                        newest_backup
-                    )
-                })?;
-
-                let output = Command::new("systemctl")
-                    .args(["restart", "sshd"])
-                    .output()
-                    .await
-                    .context("Не удалось перезапустить службу SSH")?;
-
-                if !output.status.success() {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    warn!("Ошибка перезапуска службы SSH: {}", stderr);
-                }
-            }
-        }
-
-        info!("Удаление настроек сервера успешно завершено");
+    // Останавливаем контейнеры
+    if let Err(e) = uninstall_helpers::stop_containers(&settings_dir, current_user).await {
+        warn!("Ошибка при остановке контейнеров: {}", e);
+        // Продолжаем процесс удаления
     }
+
+    // Удаляем GitLab Runners
+    if let Err(e) = uninstall_helpers::remove_gitlab_runners(&settings_dir, current_user).await {
+        warn!("Ошибка при удалении GitLab Runners: {}", e);
+        // Продолжаем процесс удаления
+    }
+
+    // Удаляем Docker сеть
+    if let Err(e) = uninstall_helpers::remove_docker_network(current_user).await {
+        warn!("Ошибка при удалении Docker сети: {}", e);
+        // Продолжаем процесс удаления
+    }
+
+    // Восстанавливаем SSH конфигурацию
+    if let Err(e) = uninstall_helpers::restore_ssh_config(current_user).await {
+        warn!("Ошибка при восстановлении SSH конфигурации: {}", e);
+        // Продолжаем процесс удаления
+    }
+
+    // Удаляем директории с настройками
+    if let Err(e) = uninstall_helpers::remove_server_settings(&settings_dir, current_user).await {
+        warn!("Ошибка при удалении директорий с настройками: {}", e);
+        // Продолжаем процесс удаления
+    }
+
+    info!("Удаление настроек сервера успешно завершено");
 
     Ok(())
 }
